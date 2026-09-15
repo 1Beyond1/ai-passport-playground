@@ -1,4 +1,4 @@
-// Direct-launch Orbital Post. Desktop Monitor remains available in source.
+// Direct-launch Chinese Pocket Universe. Desktop Monitor remains in source.
 #include "bsp_battery.h"
 #include "bsp_button.h"
 #include "bsp_display.h"
@@ -27,7 +27,7 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "AI Passport Orbital Post starting");
+    ESP_LOGI(TAG, "AI Passport Pocket Universe starting");
     demo_orbit_restore();
 
     // The monitor uses the shared bus only for the optional battery header.
@@ -55,7 +55,7 @@ void app_main(void)
         bsp_lvgl_unlock();
     }
 
-    ESP_LOGI(TAG, "Orbital Post ready; three-key offline passport");
+    ESP_LOGI(TAG, "Pocket Universe ready; four offline tools, Chinese UI");
     key_event_t event;
     while (xQueueReceive(keys, &event, portMAX_DELAY) == pdTRUE) {
         if (!bsp_lvgl_lock(100)) continue;

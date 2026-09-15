@@ -1,17 +1,26 @@
 English | [简体中文](README.zh_CN.md)
 
-# Orbital Post
+# Pocket Universe / Orbital Post
 
-A tiny offline passport for PIP-01, a pixel courier collecting letters from six imaginary places. No account, network, music files or cloud service is needed. This is a short interactive vignette, not a procedural game or real radio receiver.
+A Chinese-first four-tool collection for the AI Passport. It includes a localized interstellar post office, wearable mood sign, random decision tools, and a reaction-time game. No account, network, music files, or cloud service is needed.
+
+## Included tools
+
+- Interstellar post office: collect six fictional letters and persistent postmarks.
+- Mood sign: switch between six large, colorful wearable status cards.
+- Randomizer: coin, six-sided die, and six short decision prompts.
+- Reaction test: wait for green and measure button response time.
 
 ## Controls
 
-- Passport / collection: UP and DOWN switch pages; OK enters destinations.
-- Destinations: UP and DOWN select a place; OK starts a five-second delivery.
-- Arrival: read the letter; OK opens your stamp collection.
-- Hold OK anywhere to cancel and return to the passport.
+- Home: UP and DOWN select; OK enters.
+- Inside a tool: UP and DOWN change choices; OK performs the action.
+- Hold OK to return home.
+- After 90 seconds without input the backlight turns off; the next key only wakes it.
 
-The courier blinks and hops. Each first delivery saves a stamp in the ordinary NVS namespace `orbit_post`. Writes run in a worker, not the button callback. If storage initialization fails, collection is session-only. In-flight saves can be lost if power is removed immediately. This version has no automatic screen sleep and does not redefine the physical power switch. No sound or real wireless scanning occurs.
+The courier blinks and hops. Each first delivery saves a stamp in the ordinary NVS namespace `orbit_post`. Writes run in a worker, not the button callback. If storage initialization fails, collection is session-only. In-flight saves can be lost if power is removed immediately. The application does not redefine the physical power switch. No sound or real wireless scanning occurs.
+
+The subsetted 16 px and 28 px Chinese fonts are generated from Source Han Sans SC under SIL OFL 1.1; the license is included in `assets/fonts/SourceHanSansSC-OFL.txt`.
 
 ## Build
 
@@ -37,4 +46,4 @@ cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_orbit_state.c main/orbit_sta
 ./test_orbit
 ```
 
-Tests cover navigation, timer rollover, cancellation, duplicate delivery and collecting all six stamps. Visual clipping, physical key response, battery life and persistence after power cycling require device checks.
+Tests cover menu/tool navigation, random bounds, reaction timing and rollover, cancellation, duplicate delivery, and collecting all six stamps. Visual clipping, physical key response, battery life and persistence after power cycling require device checks.
