@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Passport · Desktop Monitor Simulator</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="workspace">
+    <header class="masthead">
+      <div class="masthead-copy">
+        <p class="eyebrow">AI PASSPORT / DEVICE LAB</p>
+        <h1>Desktop Monitor</h1>
+        <p class="lede">先在浏览器里验证三键交互和桌面状态，再决定是否刷入设备。</p>
+        <div class="masthead-meta" aria-label="Simulator scope">
+          <span>USB STATUS MONITOR</span>
+          <span>WEB TEST BENCH</span>
+        </div>
+      </div>
+      <div class="masthead-actions">
+        <div class="spec-chip">
+          <strong>240 × 320</strong>
+          <small>VIEWPORT</small>
+        </div>
+        <div class="spec-chip">
+          <strong>3 KEYS</strong>
+          <small>INPUT</small>
+        </div>
+        <div class="header-status" id="transportBadge">
+          <span class="status-dot"></span>
+          <span>MOCK STREAM</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="lab-grid" aria-label="AI Passport simulator">
+      <div class="device-stage">
+        <div class="stage-header">
+          <span class="eyebrow">PRODUCT SPECIMEN</span>
+          <span class="stage-code">USB / LIVE PREVIEW</span>
+        </div>
+        <div class="stage-rail" aria-hidden="true"><i></i></div>
+        <div class="device-shell">
+          <div class="device-speaker"></div>
+          <div class="device-screen-wrap">
+            <div class="device-screen" id="deviceScreen" tabindex="0" aria-label="AI Passport screen"></div>
+          </div>
+          <div class="device-buttons" aria-label="Three button controls">
+            <button class="hardware-button" data-key="up" aria-label="Up">↑</button>
+            <button class="hardware-button hardware-ok" data-key="ok" aria-label="OK">OK</button>
+            <button class="hardware-button" data-key="down" aria-label="Down">↓</button>
+          </div>
+          <p class="device-mark">The Open Wearable AI Passport</p>
+        </div>
+        <div class="stage-caption">
+          <span class="live-led"></span>
+          <span>240 × 320 display simulation</span>
+        </div>
+      </div>
+
+      <aside class="control-desk">
+        <div class="desk-section desk-section-top">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">TRANSPORT</p>
+              <h2>数据来源</h2>
+            </div>
+            <span class="small-badge" id="sourceBadge">MOCK</span>
+          </div>
+          <div class="segmented" role="tablist" aria-label="Data source">
+            <button class="segment active" id="mockMode" role="tab" aria-selected="true">模拟数据</button>
+            <button class="segment" id="bridgeMode" role="tab" aria-selected="false">电脑桥接</button>
+            <button class="segment" id="serialMode" role="tab" aria-selected="false">USB 串口</button>
+          </div>
+          <p class="helper" id="transportHelp">自动生成 CPU、GPU、内存、磁盘、网络和游戏监控数据。用于先验 UI 和按键逻辑。</p>
+          <button class="primary-button" id="bridgeConnect" hidden>连接本机 Bridge</button>
+          <button class="primary-button" id="serialConnect" hidden>选择 USB 串口</button>
+        </div>
+
+        <div class="desk-section" id="mockControls">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">MOCK INPUT</p>
+              <h2>电脑状态</h2>
+            </div>
+            <button class="text-button" id="randomize">随机一组</button>
+          </div>
+          <label class="range-row">
+            <span><b>CPU</b><output id="cpuOutput">37%</output></span>
+            <input id="cpuRange" type="range" min="0" max="100" value="37">
+          </label>
+          <label class="range-row">
+            <span><b>GPU</b><output id="gpuOutput">61%</output></span>
+            <input id="gpuRange" type="range" min="0" max="100" value="61">
+          </label>
+          <label class="range-row">
+            <span><b>MEMORY</b><output id="memOutput">58%</output></span>
+            <input id="memRange" type="range" min="0" max="100" value="58">
+          </label>
+          <label class="range-row">
+            <span><b>DISK</b><output id="diskOutput">68%</output></span>
+            <input id="diskRange" type="range" min="0" max="100" value="68">
+          </label>
+          <label class="range-row">
+            <span><b>NETWORK</b><output id="netOutput">3.2 MB/s</output></span>
+            <input id="netRange" type="range" min="0" max="100" value="32">
+          </label>
+          <label class="toggle-row">
+            <span><b>自动波动</b><small>每 1.5 秒刷新一次</small></span>
+            <input id="autoMock" type="checkbox" checked>
+            <span class="toggle-ui"></span>
+          </label>
+        </div>
+
+        <div class="desk-section controls-section">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">INPUT</p>
+              <h2>三键测试</h2>
+            </div>
+            <span class="key-hint">键盘 ↑ ↓ Enter</span>
+          </div>
+          <div class="key-row">
+            <button class="key-cap" data-key="up"><span>↑</span><small>UP</small></button>
+            <button class="key-cap key-cap-ok" data-key="ok"><span>OK</span><small>CONFIRM</small></button>
+            <button class="key-cap" data-key="down"><span>↓</span><small>DOWN</small></button>
+          </div>
+          <p class="helper">短按切换页面；OK 查看详情；长按 OK 返回总览。</p>
+        </div>
+
+        <div class="desk-section protocol-section">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">USB PROTOCOL</p>
+              <h2>串口约定</h2>
+            </div>
+            <span class="small-badge blue">v0.1</span>
+          </div>
+          <code>PCSTAT|cpu=37|gpu=61|cpu_mhz=4200|gpu_mhz=2400|cpu_c=72|gpu_c=68|hz=165|mem=58|disk=68|rx=1.2|tx=0.4|time=14:28|uptime=3h18m|host=Windows</code>
+          <p class="helper">电脑端每秒发送一行；优先选择“电脑桥接”读取同一份实时数据。USB 串口仅适用于串口本身会输出 PCSTAT 的设备。</p>
+        </div>
+
+        <div class="event-log" aria-live="polite">
+          <div class="log-heading"><span>EVENT LOG</span><button class="text-button" id="clearLog">清空</button></div>
+          <div id="logLines"></div>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
