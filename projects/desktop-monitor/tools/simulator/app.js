@@ -1,6 +1,7 @@
 (() => {
   "use strict";
 
+  const PCStat = window.PCStat;
   const screen = document.querySelector("#deviceScreen");
   const transportBadge = document.querySelector("#transportBadge");
   const sourceBadge = document.querySelector("#sourceBadge");
@@ -27,7 +28,11 @@
       cpu: 37,
       gpu: 61,
       mem: 58,
+      memUsedGb: 9.3,
+      memTotalGb: 16,
       disk: 68,
+      diskUsedGb: 341,
+      diskTotalGb: 512,
       net: 32,
       tx: 4,
       cpuMhz: 4200,
@@ -97,10 +102,20 @@
       return [card("CPU LOAD", `${v.cpu}%`, "all cores", v.cpu), card("UPTIME", v.uptime, "since last start", null), card("HOST", v.host, "connected over USB", null)];
     }
     if (page === "Memory") {
-      return [card("MEMORY", `${v.mem}%`, "used · 9.3 / 16 GB", v.mem), card("APP SPACE", "6.7 GB", "available to apps", null), card("SWAP", "0.0 GB", "under control", null)];
+      const memInfo = PCStat.getMemoryDisplay(v, state.source === "mock");
+      return [
+        card("MEMORY", `${v.mem}%`, memInfo.pageSub, v.mem),
+        card("APP SPACE", memInfo.availableValue, memInfo.availableSub, null),
+        card("SWAP", memInfo.swapValue, memInfo.swapSub, null)
+      ];
     }
     if (page === "Storage") {
-      return [card("SYSTEM DISK", `${v.disk}%`, "used · 341 / 512 GB", v.disk), card("FREE", "171 GB", "available", null), card("HEALTH", "GOOD", "last checked now", null)];
+      const diskInfo = PCStat.getStorageDisplay(v);
+      return [
+        card("SYSTEM DISK", `${v.disk}%`, diskInfo.pageSub, v.disk),
+        card("FREE", diskInfo.freeValue, diskInfo.freeSub, null),
+        card("HEALTH", "GOOD", "last checked now", null)
+      ];
     }
     if (page === "Network") {
       return [card("DOWNLOAD", formatNet(v.net), "from desktop", null), card("UPLOAD", formatNet(v.tx), "to desktop", null), card("LINK", "USB", "stable connection", null)];
@@ -112,10 +127,12 @@
         card("DISPLAY", `${v.hz} Hz`, "current refresh rate", null, "green")
       ];
     }
+    const memInfo = PCStat.getMemoryDisplay(v, state.source === "mock");
+    const diskInfo = PCStat.getStorageDisplay(v);
     return [
       card("CPU", `${v.cpu}%`, "processor load", v.cpu),
-      card("MEMORY", `${v.mem}%`, "9.3 / 16 GB used", v.mem),
-      card("DISK", `${v.disk}%`, "system disk used", v.disk),
+      card("MEMORY", `${v.mem}%`, memInfo.overviewSub, v.mem),
+      card("DISK", `${v.disk}%`, diskInfo.overviewSub, v.disk),
       card("NETWORK", formatNet(v.net), `upload ${formatNet(v.tx)}`, null)
     ];
   }
@@ -216,25 +233,9 @@
   }
 
   function parseSerialLine(line) {
-    line = String(line).trim();
-    if (!line.startsWith("PCSTAT|")) return;
-    const values = {};
-    line.slice(7).split("|").forEach((part) => {
-      const split = part.indexOf("=");
-      if (split > 0) values[part.slice(0, split)] = part.slice(split + 1);
-    });
-    ["cpu", "mem", "disk"].forEach((key) => { if (values[key] !== undefined) state.values[key] = clamp(Number(values[key]) || 0, 0, 100); });
-    if (values.gpu !== undefined) state.values.gpu = clamp(Number(values.gpu) || 0, 0, 100);
-    if (values.rx !== undefined) state.values.net = clamp(Number(values.rx) * 10 || 0, 0, 100);
-    if (values.tx !== undefined) state.values.tx = clamp(Number(values.tx) * 10 || 0, 0, 100);
-    if (values.cpu_mhz !== undefined) state.values.cpuMhz = clamp(Number(values.cpu_mhz) || 0, 0, 10000);
-    if (values.gpu_mhz !== undefined) state.values.gpuMhz = clamp(Number(values.gpu_mhz) || 0, 0, 10000);
-    if (values.cpu_c !== undefined) state.values.cpuTemp = Number(values.cpu_c);
-    if (values.gpu_c !== undefined) state.values.gpuTemp = Number(values.gpu_c);
-    if (values.hz !== undefined) state.values.hz = clamp(Number(values.hz) || 0, 0, 1000);
-    if (values.time) state.values.time = values.time;
-    if (values.uptime) state.values.uptime = values.uptime.replace(/^0+/, "") || "0m";
-    if (values.host) state.values.host = values.host;
+    const parsed = PCStat.parsePcstatLine(line, state.values);
+    if (!parsed) return;
+    state.values = parsed;
     state.live = true;
     updateTransportUi();
     syncInputs();
@@ -244,7 +245,7 @@
 
   async function connectSerial() {
     if (!("serial" in navigator)) {
-      addLog("Web Serial requires Chrome/Edge on localhost", "info");
+      addLog("Web Serial requires Chrome/Edge on HTTPS or localhost", "info");
       return;
     }
     try {
@@ -302,6 +303,7 @@
     closeBridgeStream();
     state.source = "mock";
     state.live = true;
+    state.values = PCStat.applyMockCapacities(state.values);
     transportHelp.textContent = "自动生成 CPU、内存、磁盘和网络变化。用于先验 UI 和按键逻辑。";
     updateTransportUi();
     addLog("switched to mock stream", "ok");
@@ -364,6 +366,7 @@
     state.values.gpuTemp = Math.round(50 + Math.random() * 32);
     state.values.hz = [60, 120, 144, 165, 240][Math.floor(Math.random() * 5)];
     state.values.time = formatTime();
+    state.values = PCStat.applyMockCapacities(state.values);
     syncInputs();
     renderScreen();
     addLog("mock snapshot regenerated", "ok");
@@ -382,6 +385,7 @@
     state.values.cpuTemp = clamp(Math.round(state.values.cpuTemp + (Math.random() - .5) * 4), 35, 100);
     state.values.gpuTemp = clamp(Math.round(state.values.gpuTemp + (Math.random() - .5) * 4), 35, 95);
     state.values.time = formatTime();
+    state.values = PCStat.applyMockCapacities(state.values);
     syncInputs();
     renderScreen();
   }
@@ -404,6 +408,9 @@
   [["cpuRange", "cpu", "cpuOutput"], ["gpuRange", "gpu", "gpuOutput"], ["memRange", "mem", "memOutput"], ["diskRange", "disk", "diskOutput"], ["netRange", "net", "netOutput"]].forEach(([inputId, key, outputId]) => {
     document.querySelector(`#${inputId}`).addEventListener("input", (event) => {
       state.values[key] = Number(event.target.value);
+      if (state.source === "mock" && (key === "mem" || key === "disk")) {
+        state.values = PCStat.applyMockCapacities(state.values);
+      }
       document.querySelector(`#${outputId}`).textContent = key === "net" ? formatNet(state.values[key]) : `${state.values[key]}%`;
       renderScreen();
     });

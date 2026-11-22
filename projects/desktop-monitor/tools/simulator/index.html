@@ -138,8 +138,8 @@
             </div>
             <span class="small-badge blue">v0.1</span>
           </div>
-          <code>PCSTAT|cpu=37|gpu=61|cpu_mhz=4200|gpu_mhz=2400|cpu_c=72|gpu_c=68|hz=165|mem=58|disk=68|rx=1.2|tx=0.4|time=14:28|uptime=3h18m|host=Windows</code>
-          <p class="helper">电脑端每秒发送一行；优先选择“电脑桥接”读取同一份实时数据。USB 串口仅适用于串口本身会输出 PCSTAT 的设备。</p>
+          <code>PCSTAT|cpu=37|gpu=61|cpu_mhz=4200|gpu_mhz=2400|cpu_c=72|gpu_c=68|hz=165|mem=58|disk=68|rx=1.2|tx=0.4|mem_used_gb=9.3|mem_total_gb=16.0|disk_used_gb=341.2|disk_total_gb=512.0|time=14:28|uptime=3h18m|host=Windows</code>
+          <p class="helper">电脑端每秒发送一行；优先选择“电脑桥接”读取同一份实时数据。<code>*_gb</code> 为可选扩展字段，旧格式无容量字段时自动降级显示；USB 串口仅适用于串口本身会输出 PCSTAT 的设备。</p>
         </div>
 
         <div class="event-log" aria-live="polite">
@@ -149,6 +149,7 @@
       </aside>
     </section>
   </main>
+  <script src="pcstat.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
