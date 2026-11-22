@@ -11,3 +11,9 @@ Based on [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport), under th
 Both target ESP32-C3, ESP-IDF 5.5.3 and a 240x320 display. Each directory is a standalone ESP-IDF project with its own BSP, dependency lock and partition table. They are alternative applications, not simultaneous apps.
 
 Never erase flash or overwrite the protected `cardid` partition at `0x356000`. Device backups, identities, credentials and local logs are intentionally excluded. Hardware validation is distinct from compilation; see each project's limitations.
+
+## Preview
+
+**Desktop Monitor** includes a browser-based `240 × 320` display simulator with three-key (`↑` / `OK` / `↓`) interactive controls, mock telemetry sliders, and transport mode switching (`Mock`, `Computer Bridge`, `USB Serial`) for verifying UI and input flow before flashing:
+
+![Desktop Monitor 240×320 Web Simulator](docs/screenshots/desktop-monitor-simulator.png)
