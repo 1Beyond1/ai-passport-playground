@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  c-state-tests:
+    name: C11 State Machine Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and run Orbital Post state tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -Iprojects/orbital-post/main \
+            projects/orbital-post/tests/test_orbit_state.c \
+            projects/orbital-post/main/orbit_state.c \
+            -o /tmp/test_orbit_state
+          /tmp/test_orbit_state
+
+          cc -std=c11 -Wall -Wextra -Werror -Iprojects/orbital-post/main \
+            projects/orbital-post/tests/test_pocket_state.c \
+            projects/orbital-post/main/pocket_state.c \
+            -o /tmp/test_pocket_state
+          /tmp/test_pocket_state
+
+      - name: Build and run Desktop Monitor state parser tests
+        run: |
+          cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Iprojects/desktop-monitor/main \
+            projects/desktop-monitor/tests/test_desktop_state.c \
+            projects/desktop-monitor/main/desktop_state.c \
+            -o /tmp/test_desktop_state
+          /tmp/test_desktop_state
+
+  python-bridge-tests:
+    name: Python Bridge Checks & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bridge dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r projects/desktop-monitor/tools/requirements.txt
+
+      - name: Compile-check Python scripts
+        run: |
+          python -m py_compile \
+            projects/desktop-monitor/tools/desktop_bridge.py \
+            projects/desktop-monitor/tools/tests/test_desktop_bridge.py
+
+      - name: Run Python bridge unit tests
+        run: |
+          python -m unittest discover -s projects/desktop-monitor/tools/tests -p "test_*.py" -v
+
+  simulator-js-tests:
+    name: Simulator JS Syntax & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax-check simulator scripts
+        run: |
+          node --check projects/desktop-monitor/tools/simulator/pcstat.js
+          node --check projects/desktop-monitor/tools/simulator/app.js
+
+      - name: Run simulator PCSTAT unit tests
+        run: |
+          node --test projects/desktop-monitor/tools/tests/test_simulator_pcstat.test.js
