@@ -16,20 +16,37 @@ import threading
 import time
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import psutil
-import serial
-from serial import SerialException
+
+try:
+    import serial
+    from serial import SerialException
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover - optional when running --http-only
+    serial = None  # type: ignore[assignment]
+    list_ports = None  # type: ignore[assignment]
+
+    class SerialException(OSError):
+        """Fallback serial error when pyserial is not installed."""
 
 
-DEFAULT_PORT = "COM3"
+DEFAULT_PORT = "auto"
 DEFAULT_INTERVAL = 1.0
 DEFAULT_LHM_DATA_URL = "http://127.0.0.1:8085/data.json"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
+ESPRESSIF_USB_VID = 0x303A
+ESPRESSIF_JTAG_PID = 0x1001
+BYTES_PER_GIB = 1024 ** 3
+# Firmware desktop_state.c rejects lines with strlen(line) >= 256 (DESKTOP_LINE_LEN)
+# and demo_desktop.c drops lines >= 255 bytes before '\n'. Keep encoded frames
+# including '\n' at most 255 bytes so strlen(line) is always <= 255 (< 256).
+MAX_PCSTAT_LINE_BYTES = 255
+MAX_RATE_MB_S = 6553.5
 
 
 class StatusStreamHub:
@@ -38,6 +55,29 @@ class StatusStreamHub:
     def __init__(self) -> None:
         self._clients: list[queue.Queue[str]] = []
         self._lock = threading.Lock()
+        self._serial_port: Optional[str] = None
+        self._serial_connected = False
+        self._port_mode = "auto"
+
+    def set_serial_status(
+        self,
+        *,
+        port: Optional[str],
+        connected: bool,
+        mode: str,
+    ) -> None:
+        with self._lock:
+            self._serial_port = port
+            self._serial_connected = connected
+            self._port_mode = mode
+
+    def serial_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "port_mode": self._port_mode,
+                "serial_port": self._serial_port,
+                "serial_connected": self._serial_connected,
+            }
 
     def subscribe(self) -> queue.Queue[str]:
         client: queue.Queue[str] = queue.Queue(maxsize=4)
@@ -82,13 +122,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
     def _write_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Cache-Control", "no-cache, no-transform")
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib handler API
+        self.send_response(204)
+        self._write_cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         if self.path == "/health":
-            payload = json.dumps(
-                {"ok": True, "protocol": "PCSTAT", "clients": self.hub.client_count()}
-            ).encode("ascii")
+            health_body = {
+                "ok": True,
+                "protocol": "PCSTAT",
+                "clients": self.hub.client_count(),
+                **self.hub.serial_status(),
+            }
+            payload = json.dumps(health_body).encode("ascii")
             self.send_response(200)
             self._write_cors()
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -131,8 +183,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 def start_status_server(host: str, port: int, hub: StatusStreamHub) -> ThreadingHTTPServer:
     """Start the browser stream without blocking the metric/serial loop."""
 
-    BridgeRequestHandler.hub = hub
-    server = ThreadingHTTPServer((host, port), BridgeRequestHandler)
+    handler_cls = type("BoundBridgeRequestHandler", (BridgeRequestHandler,), {"hub": hub})
+    server = ThreadingHTTPServer((host, port), handler_cls)
     server.daemon_threads = True
     thread = threading.Thread(
         target=server.serve_forever,
@@ -528,8 +580,89 @@ def safe_host_name() -> str:
     return host.encode("ascii", "replace").decode("ascii")[:20] or "Windows"
 
 
-def open_serial(port_name: str) -> serial.Serial:
+def default_system_disk_path() -> str:
+    """Return the system root path for psutil.disk_usage()."""
+
+    if os.name == "nt":
+        system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\/")
+        return f"{system_drive}\\"
+    return "/"
+
+
+def bytes_to_gb(byte_count: float) -> float:
+    """Convert a byte count to GiB (reported as GB by Windows/macOS UIs)."""
+
+    return max(0.0, float(byte_count)) / BYTES_PER_GIB
+
+
+def is_auto_port(port_name: Optional[str]) -> bool:
+    """Return True when the user asked for automatic Espressif port detection."""
+
+    return bool(port_name and port_name.strip().lower() == "auto")
+
+
+def _port_sort_key(port_info: Any) -> tuple[int, int, str]:
+    pid = getattr(port_info, "pid", None)
+    description = " ".join(
+        str(getattr(port_info, attr, "") or "")
+        for attr in ("description", "product", "interface", "manufacturer")
+    ).lower()
+    is_jtag_pid = 0 if pid == ESPRESSIF_JTAG_PID else 1
+    is_jtag_desc = 0 if any(tok in description for tok in ("jtag", "serial", "espressif")) else 1
+    device = str(getattr(port_info, "device", "") or "")
+    return (is_jtag_pid, is_jtag_desc, device)
+
+
+def list_espressif_ports(
+    port_lister: Optional[Callable[[], Iterable[Any]]] = None,
+) -> list[Any]:
+    """Return connected serial ports whose USB VID matches Espressif (0x303A)."""
+
+    lister = port_lister
+    if lister is None:
+        if list_ports is None:
+            return []
+        lister = list_ports.comports
+    try:
+        ports = list(lister())
+    except OSError:
+        return []
+    matched = [
+        port for port in ports
+        if getattr(port, "vid", None) == ESPRESSIF_USB_VID and getattr(port, "device", None)
+    ]
+    matched.sort(key=_port_sort_key)
+    return matched
+
+
+def detect_espressif_port(
+    port_lister: Optional[Callable[[], Iterable[Any]]] = None,
+) -> Optional[str]:
+    """Return the preferred Espressif USB Serial/JTAG port device, if present."""
+
+    matched = list_espressif_ports(port_lister=port_lister)
+    if not matched:
+        return None
+    return str(matched[0].device)
+
+
+def resolve_serial_port(
+    requested_port: str,
+    port_lister: Optional[Callable[[], Iterable[Any]]] = None,
+) -> Optional[str]:
+    """Resolve '--port auto' via USB VID 0x303A, or pass explicit ports through."""
+
+    if is_auto_port(requested_port):
+        return detect_espressif_port(port_lister=port_lister)
+    cleaned = requested_port.strip()
+    return cleaned or None
+
+
+def open_serial(port_name: str) -> Any:
     """Open USB Serial/JTAG without toggling DTR/RTS into a reset."""
+
+    if serial is None:
+        raise SerialException("pyserial is not installed")
 
     connection = serial.Serial(
         port=None,
@@ -546,6 +679,33 @@ def open_serial(port_name: str) -> serial.Serial:
     return connection
 
 
+def close_serial_safely(connection: Any) -> None:
+    """Close a serial connection without raising secondary cleanup errors."""
+
+    if connection is None:
+        return
+    try:
+        if getattr(connection, "is_open", True):
+            connection.close()
+    except (SerialException, OSError):
+        pass
+
+
+def _valid_capacity_pair(used_gb: Optional[float], total_gb: Optional[float]) -> Optional[tuple[float, float]]:
+    if used_gb is None or total_gb is None:
+        return None
+    try:
+        used = float(used_gb)
+        total = float(total_gb)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(used) and math.isfinite(total)):
+        return None
+    if total <= 0.0 or used < 0.0:
+        return None
+    return (min(used, total), total)
+
+
 def build_status_line(
     *,
     network_before: object,
@@ -558,15 +718,28 @@ def build_status_line(
     gpu: Optional[dict[str, int]] = None,
     cpu_temp_c: Optional[int] = None,
     refresh_hz: Optional[int] = None,
+    mem_used_gb: Optional[float] = None,
+    mem_total_gb: Optional[float] = None,
+    disk_used_gb: Optional[float] = None,
+    disk_total_gb: Optional[float] = None,
+    time_text: Optional[str] = None,
+    uptime_text: Optional[str] = None,
+    host_name: Optional[str] = None,
 ) -> bytes:
-    """Build one newline-delimited PCSTAT record for the device."""
+    """Build one newline-delimited PCSTAT record for the device and simulator.
+
+    Optional capacity fields (mem_used_gb, mem_total_gb, disk_used_gb,
+    disk_total_gb) are appended as key=value tokens. The ESP32-C3 firmware
+    parser (desktop_state.c) ignores unknown keys while requiring the total
+    line length to remain strictly below DESKTOP_LINE_LEN (256 bytes).
+    """
 
     elapsed = max(elapsed, 0.001)
     rx_rate = max(0, network_after.bytes_recv - network_before.bytes_recv)
     tx_rate = max(0, network_after.bytes_sent - network_before.bytes_sent)
-    rx_mb = rx_rate / elapsed / (1024 * 1024)
-    tx_mb = tx_rate / elapsed / (1024 * 1024)
-    fields = [
+    rx_mb = min(MAX_RATE_MB_S, rx_rate / elapsed / (1024 * 1024))
+    tx_mb = min(MAX_RATE_MB_S, tx_rate / elapsed / (1024 * 1024))
+    core_fields = [
         f"PCSTAT|cpu={round(max(0, min(100, cpu)))}",
         f"mem={round(max(0, min(100, memory)))}",
         f"disk={round(max(0, min(100, disk)))}",
@@ -574,32 +747,76 @@ def build_status_line(
         f"tx={tx_mb:.1f}",
     ]
     if cpu_mhz is not None and cpu_mhz > 0:
-        fields.append(f"cpu_mhz={cpu_mhz}")
+        core_fields.append(f"cpu_mhz={min(65535, cpu_mhz)}")
     if gpu:
         if "gpu" in gpu:
-            fields.append(f"gpu={round(max(0, min(100, gpu['gpu'])))}")
+            core_fields.append(f"gpu={round(max(0, min(100, gpu['gpu'])))}")
         if "gpu_mhz" in gpu:
-            fields.append(f"gpu_mhz={max(0, gpu['gpu_mhz'])}")
+            core_fields.append(f"gpu_mhz={min(65535, max(0, gpu['gpu_mhz']))}")
         if "gpu_c" in gpu:
-            fields.append(f"gpu_c={gpu['gpu_c']}")
+            core_fields.append(f"gpu_c={gpu['gpu_c']}")
     if cpu_temp_c is not None:
-        fields.append(f"cpu_c={cpu_temp_c}")
+        core_fields.append(f"cpu_c={cpu_temp_c}")
     if refresh_hz is not None and refresh_hz > 0:
-        fields.append(f"hz={refresh_hz}")
-    fields.extend([
-        f"time={time.strftime('%H:%M')}",
-        f"uptime={format_uptime(time.time() - psutil.boot_time())}",
-        f"host={safe_host_name()}",
-    ])
-    line = "|".join(fields) + "\n"
-    return line.encode("ascii", "replace")
+        core_fields.append(f"hz={min(65535, refresh_hz)}")
+
+    mem_pair = _valid_capacity_pair(mem_used_gb, mem_total_gb)
+    disk_pair = _valid_capacity_pair(disk_used_gb, disk_total_gb)
+    mem_extra = (
+        [f"mem_used_gb={mem_pair[0]:.1f}", f"mem_total_gb={mem_pair[1]:.1f}"]
+        if mem_pair is not None
+        else []
+    )
+    disk_extra = (
+        [f"disk_used_gb={disk_pair[0]:.1f}", f"disk_total_gb={disk_pair[1]:.1f}"]
+        if disk_pair is not None
+        else []
+    )
+
+    resolved_time = time_text if time_text is not None else time.strftime("%H:%M")
+    resolved_uptime = (
+        uptime_text
+        if uptime_text is not None
+        else format_uptime(time.time() - psutil.boot_time())
+    )
+    resolved_host = (
+        host_name.replace("|", "_").replace("=", "_").encode("ascii", "replace").decode("ascii")[:20] or "Windows"
+        if host_name is not None
+        else safe_host_name()
+    )
+
+    def encode_record(extras: list[str], host: str) -> bytes:
+        all_fields = [
+            *core_fields,
+            *extras,
+            f"time={resolved_time}",
+            f"uptime={resolved_uptime}",
+            f"host={host}",
+        ]
+        return ("|".join(all_fields) + "\n").encode("ascii", "replace")
+
+    extras = [*mem_extra, *disk_extra]
+    encoded = encode_record(extras, resolved_host)
+    if len(encoded) > MAX_PCSTAT_LINE_BYTES and len(resolved_host) > 4:
+        overflow = len(encoded) - MAX_PCSTAT_LINE_BYTES
+        trimmed_host = resolved_host[: max(4, len(resolved_host) - overflow)]
+        encoded = encode_record(extras, trimmed_host)
+    if len(encoded) > MAX_PCSTAT_LINE_BYTES and disk_extra:
+        encoded = encode_record(mem_extra, resolved_host)
+    if len(encoded) > MAX_PCSTAT_LINE_BYTES and mem_extra:
+        encoded = encode_record([], resolved_host)
+    return encoded
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     """Parse bridge command-line options."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", default=DEFAULT_PORT, help="USB Serial/JTAG port")
+    parser.add_argument(
+        "--port",
+        default=DEFAULT_PORT,
+        help="USB Serial/JTAG port, or 'auto' to detect Espressif VID 0x303A (default: auto)",
+    )
     parser.add_argument(
         "--interval",
         type=float,
@@ -618,26 +835,48 @@ def parse_args() -> argparse.Namespace:
         help="local port for /health and /stream (default: 8765)",
     )
     parser.add_argument(
+        "--http-only",
+        action="store_true",
+        help="stream metrics to the local browser simulator without opening a serial port",
+    )
+    parser.add_argument(
         "--no-http",
         action="store_true",
         help="disable the local browser stream",
     )
     parser.add_argument("--once", action="store_true", help="send one record and exit")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.http_only and args.no_http:
+        parser.error("--http-only cannot be combined with --no-http")
+    return args
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     """Collect and stream metrics until interrupted."""
 
-    args = parse_args()
+    args = parse_args(argv)
+    if not args.http_only and serial is None:
+        print(
+            "pyserial is not installed. Run 'python -m pip install -r tools/requirements.txt' "
+            "or pass --http-only to stream only to the browser simulator.",
+            flush=True,
+        )
+        return 1
+
     interval = max(0.2, args.interval)
+    auto_mode = not args.http_only and is_auto_port(args.port)
+    port_mode = "http-only" if args.http_only else ("auto" if auto_mode else "manual")
     psutil.cpu_percent(interval=None)
     previous_network = psutil.net_io_counters()
     previous_time = time.monotonic()
     sensor_cache = SensorCache()
     cpu_frequency = CpuFrequencySampler()
-    connection: Optional[serial.Serial] = None
+    connection: Optional[Any] = None
+    active_port: Optional[str] = None
+    ever_connected = False
+    last_wait_key: Optional[str] = None
     stream_hub = StatusStreamHub()
+    stream_hub.set_serial_status(port=None, connected=False, mode=port_mode)
     stream_server: Optional[ThreadingHTTPServer] = None
 
     if not args.no_http:
@@ -650,34 +889,64 @@ def main() -> int:
         except OSError as error:
             print(f"Browser stream unavailable: {error}", flush=True)
 
+    if args.http_only:
+        print("Serial output disabled (--http-only); streaming to local HTTP clients only.", flush=True)
+
     try:
         while True:
-            if connection is None:
-                try:
-                    connection = open_serial(args.port)
-                    print(f"Connected to {args.port}", flush=True)
-                except (SerialException, OSError) as error:
-                    print(f"Waiting for {args.port}: {error}", flush=True)
+            if not args.http_only and connection is None:
+                target_port = resolve_serial_port(args.port)
+                if target_port is None:
+                    wait_key = "auto:none"
+                    if last_wait_key != wait_key:
+                        print(
+                            f"Waiting for Espressif USB Serial/JTAG device (VID 0x{ESPRESSIF_USB_VID:04X})...",
+                            flush=True,
+                        )
+                        last_wait_key = wait_key
+                    stream_hub.set_serial_status(port=None, connected=False, mode=port_mode)
                     if args.once:
                         return 1
+                else:
+                    try:
+                        connection = open_serial(target_port)
+                        active_port = target_port
+                        last_wait_key = None
+                        verb = "Reconnected to" if ever_connected else "Connected to"
+                        ever_connected = True
+                        suffix = f" (auto-detected VID 0x{ESPRESSIF_USB_VID:04X})" if auto_mode else ""
+                        print(f"{verb} {active_port}{suffix}", flush=True)
+                        stream_hub.set_serial_status(port=active_port, connected=True, mode=port_mode)
+                    except (SerialException, OSError) as error:
+                        wait_key = f"{target_port}:{error}"
+                        if last_wait_key != wait_key:
+                            print(f"Waiting for {target_port}: {error}", flush=True)
+                            last_wait_key = wait_key
+                        stream_hub.set_serial_status(port=target_port, connected=False, mode=port_mode)
+                        if args.once:
+                            return 1
 
             time.sleep(interval)
             now = time.monotonic()
             current_network = psutil.net_io_counters()
-            system_drive = os.environ.get("SystemDrive", "C:")
-            current_disk = psutil.disk_usage(f"{system_drive}\\").percent
+            virtual_memory = psutil.virtual_memory()
+            disk_usage = psutil.disk_usage(default_system_disk_path())
             sensor_cache.refresh(now)
             payload = build_status_line(
                 network_before=previous_network,
                 network_after=current_network,
                 elapsed=now - previous_time,
                 cpu=psutil.cpu_percent(interval=None),
-                memory=psutil.virtual_memory().percent,
-                disk=current_disk,
+                memory=virtual_memory.percent,
+                disk=disk_usage.percent,
                 cpu_mhz=cpu_frequency.sample(),
                 gpu=read_nvidia_metrics(),
                 cpu_temp_c=sensor_cache.cpu_temperature,
                 refresh_hz=read_display_refresh_hz(),
+                mem_used_gb=bytes_to_gb(virtual_memory.used),
+                mem_total_gb=bytes_to_gb(virtual_memory.total),
+                disk_used_gb=bytes_to_gb(disk_usage.used),
+                disk_total_gb=bytes_to_gb(disk_usage.total),
             )
             previous_network = current_network
             previous_time = now
@@ -685,14 +954,23 @@ def main() -> int:
             # The browser gets the same snapshot as the device. This avoids
             # opening the device's COM port a second time from Web Serial.
             stream_hub.publish(payload)
-            if connection is not None:
+            if args.http_only:
+                print(payload.decode("ascii").rstrip(), flush=True)
+            elif connection is not None:
                 try:
                     connection.write(payload)
                     print(payload.decode("ascii").rstrip(), flush=True)
                 except (SerialException, OSError) as error:
-                    print(f"Serial connection lost: {error}", flush=True)
-                    connection.close()
+                    action = "rescanning Espressif ports" if auto_mode else f"retrying {active_port}"
+                    print(
+                        f"Serial connection lost on {active_port}: {error} ({action})",
+                        flush=True,
+                    )
+                    close_serial_safely(connection)
                     connection = None
+                    active_port = None
+                    last_wait_key = None
+                    stream_hub.set_serial_status(port=None, connected=False, mode=port_mode)
                     if args.once:
                         return 1
 
@@ -702,8 +980,7 @@ def main() -> int:
         print("Stopping desktop bridge", flush=True)
         return 0
     finally:
-        if connection is not None and connection.is_open:
-            connection.close()
+        close_serial_safely(connection)
         cpu_frequency.close()
         if stream_server is not None:
             stream_server.shutdown()
