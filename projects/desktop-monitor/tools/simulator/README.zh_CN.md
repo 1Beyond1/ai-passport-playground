@@ -1,14 +1,12 @@
-<p align="right">
-  <strong>简体中文</strong> · <a href="README.md">English</a>
-</p>
+[English](README.md) | 简体中文
 
 # AI Passport 网页模拟器
 
-这是为 **Desktop Monitor** 功能准备的浏览器优先测试台。它独立于 ESP-IDF，可在刷写硬件前验证视觉布局、三键导航、长按行为和电脑状态协议。
+这是为 **Desktop Monitor** 应用准备的浏览器优先测试台。它独立于 ESP-IDF，可在刷写硬件前验证视觉布局、三键导航、长按行为和电脑状态协议。
 
 ## 本地运行
 
-在仓库根目录执行：
+在 `projects/desktop-monitor` 目录执行：
 
 ```powershell
 python -m http.server 4173 --directory tools/simulator
@@ -31,7 +29,7 @@ python tools/desktop_bridge.py --port COM3
 
 ## USB 状态协议
 
-未来的电脑端桥接程序和设备之间使用每行一条记录的协议：
+电脑端桥接程序和设备之间使用每行一条记录的协议：
 
 ```text
 PCSTAT|cpu=37|gpu=61|cpu_mhz=4200|gpu_mhz=2400|cpu_c=72|gpu_c=68|hz=165|mem=58|disk=68|rx=1.2|tx=0.4|time=14:28|uptime=3h18m|host=Windows

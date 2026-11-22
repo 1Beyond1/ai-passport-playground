@@ -3,7 +3,7 @@
 # AI Passport Playground
 
 FoloToy AI Passport 独立实验合集，每个项目放在自己的文件夹。
-基于 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport)，遵循 MIT 许可。LICENSE 保留原始 BSP 与像素角色的作者声明。
+基于 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport)，遵循 MIT 许可。[LICENSE](LICENSE) 保留原始 BSP 与像素角色的作者声明。
 
 - [小宇宙 / 轨道邮局](projects/orbital-post/README.zh_CN.md)：中文四功能合集，包含星际来信、心情挂牌、随机器和反应测试。
 - [电脑监控](projects/desktop-monitor/README.zh_CN.md)：保留之前的 USB 监控程序、Windows 桥接和浏览器模拟器。

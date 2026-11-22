@@ -1,14 +1,12 @@
-<p align="right">
-  <a href="README.zh_CN.md">简体中文</a> · <strong>English</strong>
-</p>
+English | [简体中文](README.zh_CN.md)
 
 # AI Passport Web Simulator
 
-This is a browser-first test bench for the planned **Desktop Monitor** play. It is deliberately independent of ESP-IDF so visual layout, three-button navigation, long-press behavior, and the PC status protocol can be tested before flashing hardware.
+This is a browser-first test bench for the **Desktop Monitor** application. It is deliberately independent of ESP-IDF so visual layout, three-button navigation, long-press behavior, and the PC status protocol can be tested before flashing hardware.
 
 ## Run locally
 
-From the repository root:
+From `projects/desktop-monitor`:
 
 ```powershell
 python -m http.server 4173 --directory tools/simulator
@@ -33,7 +31,7 @@ writing into the device.
 
 ## USB status protocol
 
-The future desktop bridge and the device use one newline-delimited record per update:
+The desktop bridge and the device use one newline-delimited record per update:
 
 ```text
 PCSTAT|cpu=37|gpu=61|cpu_mhz=4200|gpu_mhz=2400|cpu_c=72|gpu_c=68|hz=165|mem=58|disk=68|rx=1.2|tx=0.4|time=14:28|uptime=3h18m|host=Windows

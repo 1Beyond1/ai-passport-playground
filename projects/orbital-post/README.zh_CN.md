@@ -20,7 +20,7 @@ AI Passport 的中文四功能离线合集，包含汉化星际邮局、随身�
 
 邮差会眨眼和跳动。每个地点首次投递后，在普通 NVS 的 `orbit_post` 命名空间保存邮戳。写入由工作任务执行，不阻塞按钮回调。存储初始化失败则只保存本次会话；刚完成时立即断电可能丢失尚未完成的写入。本应用没有重新定义实体电源开关。不播放音效、不进行真实无线扫描。
 
-16 和 28 像素精简中文字库由思源黑体简体中文生成，遵循 SIL OFL 1.1；许可副本位于 `assets/fonts/SourceHanSansSC-OFL.txt`。
+16 和 28 像素精简中文字库由思源黑体简体中文生成，遵循 SIL OFL 1.1；许可副本位于 [assets/fonts/SourceHanSansSC-OFL.txt](assets/fonts/SourceHanSansSC-OFL.txt)。
 
 ## 编译
 
@@ -44,6 +44,8 @@ python -m esptool --chip esp32c3 --port YOUR_PORT --baud 115200 write_flash 0x10
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_orbit_state.c main/orbit_state.c -o test_orbit
 ./test_orbit
+cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_pocket_state.c main/pocket_state.c -o test_pocket
+./test_pocket
 ```
 
 测试覆盖菜单与功能导航、随机数范围、反应计时及回绕、取消、重复投递和六枚邮戳集齐。显示裁切、实体按钮反馈、续航及断电持久化仍需实机检查。
