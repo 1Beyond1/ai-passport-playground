@@ -11,6 +11,27 @@
   const serialConnect = document.querySelector("#serialConnect");
   const logLines = document.querySelector("#logLines");
   const BRIDGE_STREAM_URL = "http://127.0.0.1:8765/stream";
+  const MAX_SERIAL_BUFFER_CHARS = 4096;
+  const DEFAULT_MOCK_VALUES = {
+    cpu: 37,
+    gpu: 61,
+    mem: 58,
+    memUsedGb: 9.3,
+    memTotalGb: 16,
+    disk: 68,
+    diskUsedGb: 341,
+    diskTotalGb: 512,
+    net: 32,
+    tx: 4,
+    cpuMhz: 4200,
+    gpuMhz: 2400,
+    cpuTemp: 72,
+    gpuTemp: 68,
+    hz: 165,
+    time: "14:28",
+    uptime: "3h 18m",
+    host: "Windows"
+  };
   const state = {
     page: 0,
     detail: false,
@@ -23,27 +44,10 @@
     serialPort: null,
     serialReader: null,
     serialWriter: null,
+    serialPipeClosed: null,
+    serialSessionId: 0,
     serialBuffer: "",
-    values: {
-      cpu: 37,
-      gpu: 61,
-      mem: 58,
-      memUsedGb: 9.3,
-      memTotalGb: 16,
-      disk: 68,
-      diskUsedGb: 341,
-      diskTotalGb: 512,
-      net: 32,
-      tx: 4,
-      cpuMhz: 4200,
-      gpuMhz: 2400,
-      cpuTemp: 72,
-      gpuTemp: 68,
-      hz: 165,
-      time: "14:28",
-      uptime: "3h 18m",
-      host: "Windows"
-    }
+    values: { ...DEFAULT_MOCK_VALUES }
   };
 
   const pages = ["Overview", "CPU", "Memory", "Storage", "Network", "Gaming"];
@@ -121,10 +125,11 @@
       return [card("DOWNLOAD", formatNet(v.net), "from desktop", null), card("UPLOAD", formatNet(v.tx), "to desktop", null), card("LINK", "USB", "stable connection", null)];
     }
     if (page === "Gaming") {
+      const gaming = PCStat.getGamingDisplay(v);
       return [
-        card("CPU", `${v.cpu}% · ${v.cpuMhz} MHz`, `${v.cpuTemp} C temperature`, v.cpu, "blue"),
-        card("GPU", `${v.gpu}% · ${v.gpuMhz} MHz`, `${v.gpuTemp} C temperature`, v.gpu, "purple"),
-        card("DISPLAY", `${v.hz} Hz`, "current refresh rate", null, "green")
+        card("CPU", gaming.cpuValue, gaming.cpuSub, gaming.cpuPercent, "blue"),
+        card("GPU", gaming.gpuValue, gaming.gpuSub, gaming.gpuPercent, "purple"),
+        card("DISPLAY", gaming.displayValue, gaming.displaySub, null, "green")
       ];
     }
     const memInfo = PCStat.getMemoryDisplay(v, state.source === "mock");
@@ -161,11 +166,14 @@
   function syncInputs() {
     const map = [["cpu", "cpuRange", "cpuOutput"], ["gpu", "gpuRange", "gpuOutput"], ["mem", "memRange", "memOutput"], ["disk", "diskRange", "diskOutput"]];
     map.forEach(([key, inputId, outputId]) => {
-      document.querySelector(`#${inputId}`).value = state.values[key];
-      document.querySelector(`#${outputId}`).textContent = `${state.values[key]}%`;
+      const val = state.values[key];
+      const hasVal = typeof val === "number" && Number.isFinite(val);
+      document.querySelector(`#${inputId}`).value = hasVal ? clamp(val, 0, 100) : 0;
+      document.querySelector(`#${outputId}`).textContent = hasVal ? `${val}%` : "--";
     });
-    document.querySelector("#netRange").value = state.values.net;
-    document.querySelector("#netOutput").textContent = formatNet(state.values.net);
+    const netVal = typeof state.values.net === "number" && Number.isFinite(state.values.net) ? state.values.net : 0;
+    document.querySelector("#netRange").value = clamp(netVal, 0, 100);
+    document.querySelector("#netOutput").textContent = formatNet(netVal);
   }
 
   function changePage(delta) {
@@ -194,41 +202,149 @@
 
   function bindPress(button) {
     let timer = null;
+    let pressed = false;
     let held = false;
     const key = button.dataset.key;
+    const cancel = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      pressed = false;
+      held = false;
+    };
     const start = (event) => {
       event.preventDefault();
-      held = false;
-      timer = window.setTimeout(() => { held = true; press(key, true); }, 720);
+      cancel();
+      pressed = true;
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (!pressed) return;
+        held = true;
+        press(key, true);
+      }, 720);
     };
     const end = (event) => {
       event.preventDefault();
-      if (timer) window.clearTimeout(timer);
-      if (!held) press(key);
+      if (!pressed) return;
+      const wasHeld = held;
+      cancel();
+      if (!wasHeld) press(key);
     };
     button.addEventListener("pointerdown", start);
     button.addEventListener("pointerup", end);
-    button.addEventListener("pointerleave", () => { if (timer) window.clearTimeout(timer); });
+    button.addEventListener("pointerleave", cancel);
+    button.addEventListener("pointercancel", cancel);
   }
 
-  async function readSerialLoop() {
-    if (!state.serialPort) return;
-    const decoder = new TextDecoderStream();
-    state.serialPort.readable.pipeTo(decoder.writable).catch(() => {});
-    state.serialReader = decoder.readable.getReader();
+  async function closeSerialPort(expectedSessionId = null) {
+    if (expectedSessionId !== null && expectedSessionId !== state.serialSessionId) {
+      return;
+    }
+    const hadSession = Boolean(state.serialPort || state.serialReader || state.serialConnected);
+    const reader = state.serialReader;
+    const pipeClosed = state.serialPipeClosed;
+    const port = state.serialPort;
+
+    state.serialSessionId += 1;
+    state.serialReader = null;
+    state.serialPipeClosed = null;
+    state.serialPort = null;
+    state.serialBuffer = "";
+    state.serialConnected = false;
+    if (state.source === "serial") {
+      state.live = false;
+    }
+
+    if (hadSession) {
+      updateTransportUi();
+      renderScreen();
+    }
+
+    if (reader) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore cancel errors on already-closed streams.
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore lock release errors if already detached.
+      }
+    }
+    if (pipeClosed) {
+      try {
+        await pipeClosed;
+      } catch {
+        // Expected when pipeTo aborts due to reader cancellation.
+      }
+    }
+    if (port) {
+      try {
+        await port.close();
+      } catch {
+        // Ignore close errors when device was unplugged.
+      }
+    }
+    if (hadSession) {
+      updateTransportUi();
+      renderScreen();
+    }
+  }
+
+  async function readSerialLoop(sessionId, port) {
+    if (!port || sessionId !== state.serialSessionId) return;
+    let droppingOverlong = false;
+
     try {
-      while (true) {
-        const { value, done } = await state.serialReader.read();
-        if (done) break;
-        state.serialBuffer += value;
-        const lines = state.serialBuffer.split(/\r?\n/);
-        state.serialBuffer = lines.pop();
-        lines.forEach(parseSerialLine);
+      if (!port.readable) return;
+      const decoder = new TextDecoderStream();
+      const pipeClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+      const reader = decoder.readable.getReader();
+      state.serialPipeClosed = pipeClosed;
+      state.serialReader = reader;
+
+      while (sessionId === state.serialSessionId) {
+        const { value, done } = await reader.read();
+        if (done || sessionId !== state.serialSessionId) break;
+        if (!value) continue;
+
+        const combined = state.serialBuffer + value;
+        if (!combined.includes("\n") && !combined.includes("\r")) {
+          if (droppingOverlong || combined.length > MAX_SERIAL_BUFFER_CHARS) {
+            droppingOverlong = true;
+            state.serialBuffer = "";
+          } else {
+            state.serialBuffer = combined;
+          }
+          continue;
+        }
+
+        const lines = combined.split(/\r?\n/);
+        const tail = lines.pop() ?? "";
+        for (const line of lines) {
+          if (droppingOverlong) {
+            droppingOverlong = false;
+            continue;
+          }
+          if (line.length <= MAX_SERIAL_BUFFER_CHARS) {
+            parseSerialLine(line);
+          }
+        }
+        if (tail.length > MAX_SERIAL_BUFFER_CHARS) {
+          droppingOverlong = true;
+          state.serialBuffer = "";
+        } else {
+          state.serialBuffer = tail;
+        }
       }
     } catch (error) {
-      addLog(`serial read: ${error.message}`, "info");
-      state.serialConnected = false;
-      updateTransportUi();
+      if (sessionId === state.serialSessionId) {
+        addLog(`serial read: ${error.message}`, "info");
+      }
+    } finally {
+      await closeSerialPort(sessionId);
     }
   }
 
@@ -248,16 +364,32 @@
       addLog("Web Serial requires Chrome/Edge on HTTPS or localhost", "info");
       return;
     }
+    await closeSerialPort();
+    const sessionId = state.serialSessionId;
+    let port = null;
     try {
-      state.serialPort = await navigator.serial.requestPort();
-      await state.serialPort.open({ baudRate: 115200 });
+      port = await navigator.serial.requestPort();
+      if (state.source !== "serial" || sessionId !== state.serialSessionId) {
+        return;
+      }
+      await port.open({ baudRate: 115200 });
+      if (state.source !== "serial" || sessionId !== state.serialSessionId) {
+        await port.close().catch(() => {});
+        return;
+      }
+      state.serialPort = port;
+      state.serialBuffer = "";
       state.serialConnected = true;
       state.live = false;
       updateTransportUi();
+      renderScreen();
       transportHelp.textContent = "已连接串口，等待电脑端或设备发送 PCSTAT 行。";
       addLog("serial port opened", "ok");
-      readSerialLoop();
+      readSerialLoop(sessionId, port);
     } catch (error) {
+      if (port) {
+        await port.close().catch(() => {});
+      }
       addLog(`serial open failed · ${error.message}`, "info");
     }
   }
@@ -299,12 +431,26 @@
     bridgeConnect.textContent = state.bridgeConnected ? "Bridge 已连接" : "连接本机 Bridge";
   }
 
+  function restoreMockValues(values) {
+    const next = { ...values };
+    ["gpu", "cpuMhz", "gpuMhz", "cpuTemp", "gpuTemp", "hz"].forEach((key) => {
+      if (typeof next[key] !== "number" || !Number.isFinite(next[key])) {
+        next[key] = DEFAULT_MOCK_VALUES[key];
+      }
+    });
+    next.net = clamp(typeof next.net === "number" && Number.isFinite(next.net) ? next.net : DEFAULT_MOCK_VALUES.net, 0, 100);
+    next.tx = clamp(typeof next.tx === "number" && Number.isFinite(next.tx) ? next.tx : DEFAULT_MOCK_VALUES.tx, 0, 100);
+    return PCStat.applyMockCapacities(next);
+  }
+
   function setMockMode() {
     closeBridgeStream();
+    void closeSerialPort();
     state.source = "mock";
     state.live = true;
-    state.values = PCStat.applyMockCapacities(state.values);
+    state.values = restoreMockValues(state.values);
     transportHelp.textContent = "自动生成 CPU、内存、磁盘和网络变化。用于先验 UI 和按键逻辑。";
+    syncInputs();
     updateTransportUi();
     addLog("switched to mock stream", "ok");
     renderScreen();
@@ -313,7 +459,9 @@
   function setSerialMode() {
     closeBridgeStream();
     state.source = "serial";
-    state.live = false;
+    if (!state.serialConnected) {
+      state.live = false;
+    }
     transportHelp.textContent = "仅当串口本身会输出 PCSTAT 时使用；如果桥接程序正在占用设备串口，请改用‘电脑桥接’。";
     updateTransportUi();
     renderScreen();
@@ -322,6 +470,7 @@
 
   function connectBridge() {
     closeBridgeStream();
+    void closeSerialPort();
     state.source = "bridge";
     state.live = false;
     state.bridgeErrorLogged = false;
@@ -345,7 +494,9 @@
     stream.onerror = () => {
       if (state.bridgeStream !== stream) return;
       state.bridgeConnected = false;
+      state.live = false;
       updateTransportUi();
+      renderScreen();
       if (!state.bridgeErrorLogged) {
         state.bridgeErrorLogged = true;
         addLog("bridge offline · start desktop_bridge.py", "info");
@@ -416,7 +567,17 @@
     });
   });
   window.setInterval(tickMock, 1500);
-  window.PassportSimulator = { state, press, parseSerialLine, setMockMode, renderScreen };
+  window.PassportSimulator = {
+    state,
+    press,
+    parseSerialLine,
+    setMockMode,
+    setSerialMode,
+    connectBridge,
+    connectSerial,
+    closeSerialPort,
+    renderScreen
+  };
 
   syncInputs();
   updateTransportUi();

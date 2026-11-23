@@ -26,8 +26,10 @@ int main(void)
     assert(state.disk_percent == 0);
     assert(state.rx_tenths == 0);
     assert(state.tx_tenths == 0);
-    assert(state.cpu_temp_c == -1);
-    assert(state.gpu_temp_c == -1);
+    assert(state.cpu_temp_c == 0);
+    assert(state.gpu_temp_c == 0);
+    assert(!state.cpu_temp_valid);
+    assert(!state.gpu_temp_valid);
     assert(!state.gpu_valid);
     assert(!state.cpu_frequency_valid);
     assert(!state.gpu_frequency_valid);
@@ -50,8 +52,8 @@ int main(void)
     assert(state.cpu_frequency_valid && state.cpu_mhz == 4200);
     assert(state.gpu_valid && state.gpu_percent == 61);
     assert(state.gpu_frequency_valid && state.gpu_mhz == 2400);
-    assert(state.cpu_temp_c == 72);
-    assert(state.gpu_temp_c == 68);
+    assert(state.cpu_temp_valid && state.cpu_temp_c == 72);
+    assert(state.gpu_temp_valid && state.gpu_temp_c == 68);
     assert(state.refresh_valid && state.refresh_hz == 165);
     assert(strcmp(state.time, "14:28") == 0);
     assert(strcmp(state.uptime, "3h18m") == 0);
@@ -76,8 +78,8 @@ int main(void)
     assert(state.cpu_frequency_valid && state.cpu_mhz == 4500);
     assert(state.gpu_valid && state.gpu_percent == 50);
     assert(state.gpu_frequency_valid && state.gpu_mhz == 2100);
-    assert(state.gpu_temp_c == -10);
-    assert(state.cpu_temp_c == 0);
+    assert(state.gpu_temp_valid && state.gpu_temp_c == -10);
+    assert(state.cpu_temp_valid && state.cpu_temp_c == 0);
     assert(state.refresh_valid && state.refresh_hz == 240);
     assert(strcmp(state.time, "18:05") == 0);
     assert(strcmp(state.uptime, "5h12m") == 0);
@@ -97,13 +99,21 @@ int main(void)
     assert(!state.cpu_frequency_valid && state.cpu_mhz == 0);
     assert(!state.gpu_frequency_valid && state.gpu_mhz == 0);
     assert(!state.refresh_valid && state.refresh_hz == 0);
-    assert(state.cpu_temp_c == -1);
-    assert(state.gpu_temp_c == -1);
+    assert(!state.cpu_temp_valid && state.cpu_temp_c == 0);
+    assert(!state.gpu_temp_valid && state.gpu_temp_c == 0);
     assert(strcmp(state.host, "Laptop") == 0);
 
-    /* gpu_c alone marks GPU telemetry valid. */
+    /* gpu_c alone marks GPU temperature valid without forging 0% GPU load. */
     assert(desktop_state_parse_line(&state, "PCSTAT|gpu_c=63\n"));
-    assert(state.gpu_valid && state.gpu_temp_c == 63);
+    assert(state.gpu_temp_valid && state.gpu_temp_c == 63);
+    assert(!state.gpu_valid);
+    assert(!state.gpu_frequency_valid);
+
+    /* Sub-zero temperatures (-15 C / -10 C) remain valid via explicit flags. */
+    assert(desktop_state_parse_line(&state, "PCSTAT|cpu=5|cpu_c=-15|gpu_c=-10\n"));
+    assert(state.cpu_temp_valid && state.cpu_temp_c == -15);
+    assert(state.gpu_temp_valid && state.gpu_temp_c == -10);
+    assert(!state.gpu_valid);
 
     /* Malformed, out-of-range, and non-PCSTAT lines must leave state intact. */
     assert(!desktop_state_parse_line(NULL, "PCSTAT|cpu=10"));

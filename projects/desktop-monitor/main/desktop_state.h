@@ -22,6 +22,8 @@ typedef struct {
     bool gpu_valid;
     bool cpu_frequency_valid;
     bool gpu_frequency_valid;
+    bool cpu_temp_valid;
+    bool gpu_temp_valid;
     bool refresh_valid;
     char time[DESKTOP_TIME_LEN];
     char uptime[DESKTOP_UPTIME_LEN];

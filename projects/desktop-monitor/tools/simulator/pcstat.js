@@ -11,6 +11,8 @@
 
   const MOCK_MEM_TOTAL_GB = 16;
   const MOCK_DISK_TOTAL_GB = 512;
+  const MAX_RATE_TENTHS = 65535;
+  const MAX_UINT16 = 65535;
 
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
@@ -66,20 +68,33 @@
     }
 
     const next = { ...baseValues };
-    ["cpu", "mem", "disk", "gpu"].forEach((key) => {
+    ["cpu", "mem", "disk"].forEach((key) => {
       const parsed = parseFiniteNumber(fields[key]);
       if (parsed !== null) next[key] = clamp(Math.round(parsed), 0, 100);
     });
 
+    // Optional hardware telemetry is a snapshot, not a sticky patch.
+    // Clear optional Gaming fields before parsing so missing sensors never
+    // retain stale mock defaults or previous-host readings.
+    next.gpu = null;
+    next.cpuMhz = null;
+    next.gpuMhz = null;
+    next.cpuTemp = null;
+    next.gpuTemp = null;
+    next.hz = null;
+
+    const gpu = parseFiniteNumber(fields.gpu);
+    if (gpu !== null) next.gpu = clamp(Math.round(gpu), 0, 100);
+
     const rx = parseFiniteNumber(fields.rx);
-    if (rx !== null) next.net = clamp(Math.round(rx * 10), 0, 100);
+    if (rx !== null) next.net = clamp(Math.round(rx * 10), 0, MAX_RATE_TENTHS);
     const tx = parseFiniteNumber(fields.tx);
-    if (tx !== null) next.tx = clamp(Math.round(tx * 10), 0, 100);
+    if (tx !== null) next.tx = clamp(Math.round(tx * 10), 0, MAX_RATE_TENTHS);
 
     const cpuMhz = parseFiniteNumber(fields.cpu_mhz);
-    if (cpuMhz !== null) next.cpuMhz = clamp(Math.round(cpuMhz), 0, 10000);
+    if (cpuMhz !== null) next.cpuMhz = clamp(Math.round(cpuMhz), 0, MAX_UINT16);
     const gpuMhz = parseFiniteNumber(fields.gpu_mhz);
-    if (gpuMhz !== null) next.gpuMhz = clamp(Math.round(gpuMhz), 0, 10000);
+    if (gpuMhz !== null) next.gpuMhz = clamp(Math.round(gpuMhz), 0, MAX_UINT16);
 
     const cpuTemp = parseFiniteNumber(fields.cpu_c);
     if (cpuTemp !== null) next.cpuTemp = clamp(Math.round(cpuTemp), -40, 150);
@@ -87,7 +102,7 @@
     if (gpuTemp !== null) next.gpuTemp = clamp(Math.round(gpuTemp), -40, 150);
 
     const hz = parseFiniteNumber(fields.hz);
-    if (hz !== null) next.hz = clamp(Math.round(hz), 0, 1000);
+    if (hz !== null) next.hz = clamp(Math.round(hz), 0, MAX_UINT16);
 
     // Optional capacity telemetry is treated as a snapshot, not a sticky patch.
     // Legacy PCSTAT lines without *_gb keys clear capacities to null so the UI
@@ -181,15 +196,62 @@
     };
   }
 
+  function isFiniteMetric(value) {
+    return typeof value === "number" && Number.isFinite(value);
+  }
+
+  function getGamingDisplay(values) {
+    const hasCpuMhz = isFiniteMetric(values.cpuMhz);
+    const hasCpuTemp = isFiniteMetric(values.cpuTemp);
+    const hasGpu = isFiniteMetric(values.gpu);
+    const hasGpuMhz = isFiniteMetric(values.gpuMhz);
+    const hasGpuTemp = isFiniteMetric(values.gpuTemp);
+    const hasAnyGpu = hasGpu || hasGpuMhz || hasGpuTemp;
+    const hasHz = isFiniteMetric(values.hz);
+
+    const cpuValue = hasCpuMhz ? `${values.cpu}% · ${values.cpuMhz} MHz` : `${values.cpu}% · --`;
+    const cpuSub = hasCpuTemp ? `${values.cpuTemp} C temperature` : "CPU temp unavailable";
+
+    let gpuValue = "N/A";
+    let gpuSub = "GPU unavailable";
+    let gpuPercent = null;
+    if (hasAnyGpu) {
+      if (hasGpu && hasGpuMhz) {
+        gpuValue = `${values.gpu}% · ${values.gpuMhz} MHz`;
+      } else if (hasGpu) {
+        gpuValue = `${values.gpu}% · --`;
+      } else if (hasGpuMhz) {
+        gpuValue = `-- · ${values.gpuMhz} MHz`;
+      } else {
+        gpuValue = "--";
+      }
+      gpuSub = hasGpuTemp ? `${values.gpuTemp} C temperature` : "GPU temp unavailable";
+      gpuPercent = hasGpu ? values.gpu : null;
+    }
+
+    return {
+      cpuValue,
+      cpuSub,
+      cpuPercent: values.cpu,
+      gpuValue,
+      gpuSub,
+      gpuPercent,
+      displayValue: hasHz ? `${values.hz} Hz` : "-- Hz",
+      displaySub: "current refresh rate"
+    };
+  }
+
   return {
     MOCK_MEM_TOTAL_GB,
     MOCK_DISK_TOTAL_GB,
+    MAX_RATE_TENTHS,
     clamp,
     parseFiniteNumber,
     formatGb,
     applyMockCapacities,
     parsePcstatLine,
     getMemoryDisplay,
-    getStorageDisplay
+    getStorageDisplay,
+    getGamingDisplay
   };
 });

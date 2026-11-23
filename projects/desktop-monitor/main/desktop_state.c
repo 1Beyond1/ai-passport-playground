@@ -74,8 +74,10 @@ void desktop_state_init(desktop_state_t *state)
 {
     if (!state) return;
     memset(state, 0, sizeof(*state));
-    state->cpu_temp_c = -1;
-    state->gpu_temp_c = -1;
+    state->cpu_temp_c = 0;
+    state->gpu_temp_c = 0;
+    state->cpu_temp_valid = false;
+    state->gpu_temp_valid = false;
     copy_text(state->time, sizeof(state->time), "--:--");
     copy_text(state->uptime, sizeof(state->uptime), "waiting");
     copy_text(state->host, sizeof(state->host), "USB WAIT");
@@ -101,11 +103,13 @@ bool desktop_state_parse_line(desktop_state_t *state, const char *line)
     next.cpu_mhz = 0;
     next.gpu_mhz = 0;
     next.refresh_hz = 0;
-    next.cpu_temp_c = -1;
-    next.gpu_temp_c = -1;
+    next.cpu_temp_c = 0;
+    next.gpu_temp_c = 0;
     next.gpu_valid = false;
     next.cpu_frequency_valid = false;
     next.gpu_frequency_valid = false;
+    next.cpu_temp_valid = false;
+    next.gpu_temp_valid = false;
     next.refresh_valid = false;
     bool recognized = false;
     bool malformed = false;
@@ -151,11 +155,14 @@ bool desktop_state_parse_line(desktop_state_t *state, const char *line)
                 }
             } else if (strcmp(part, "cpu_c") == 0) {
                 if (!parse_temperature(value, &next.cpu_temp_c)) malformed = true;
-                else recognized = true;
+                else {
+                    next.cpu_temp_valid = true;
+                    recognized = true;
+                }
             } else if (strcmp(part, "gpu_c") == 0) {
                 if (!parse_temperature(value, &next.gpu_temp_c)) malformed = true;
                 else {
-                    next.gpu_valid = true;
+                    next.gpu_temp_valid = true;
                     recognized = true;
                 }
             } else if (strcmp(part, "hz") == 0) {

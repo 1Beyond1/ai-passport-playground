@@ -6,11 +6,13 @@ import io
 import json
 import math
 import sys
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
@@ -193,17 +195,154 @@ class PcstatFramingTests(unittest.TestCase):
         self.assertEqual(desktop_bridge._parse_lhm_value("65.5 °C"), 65.5)
 
 
+    def test_build_status_line_handles_none_network_and_strips_crlf_host(self) -> None:
+        raw = desktop_bridge.build_status_line(
+            network_before=None,
+            network_after=None,
+            elapsed=1.0,
+            cpu=15,
+            memory=25,
+            disk=35,
+            time_text="10:12",
+            uptime_text="5m",
+            host_name="Bad\r\nHost|Name=1",
+        )
+        # Exactly one trailing newline (no frame injection from CRLF in host_name)
+        self.assertEqual(raw.count(b"\n"), 1)
+        self.assertNotIn(b"\r", raw)
+        line = raw.decode("ascii").strip()
+        tokens = dict(part.split("=", 1) for part in line[7:].split("|"))
+        self.assertEqual(tokens["rx"], "0.0")
+        self.assertEqual(tokens["tx"], "0.0")
+        self.assertEqual(tokens["host"], "BadHost_Name_1")
+
+
+class AsyncSensorCacheAndBackoffTests(unittest.TestCase):
+    def test_backoff_probe_exponential_schedule_and_recovery(self) -> None:
+        probe = desktop_bridge.BackoffProbe(
+            success_interval=5.0,
+            initial_backoff=60.0,
+            max_backoff=300.0,
+            backoff_factor=2.0,
+        )
+        self.assertTrue(probe.due(0.0))
+        self.assertEqual(probe.record_failure(10.0), 60.0)
+        self.assertFalse(probe.due(69.9))
+        self.assertTrue(probe.due(70.0))
+
+        self.assertEqual(probe.record_failure(70.0), 120.0)
+        self.assertEqual(probe.record_failure(190.0), 240.0)
+        self.assertEqual(probe.record_failure(430.0), 300.0)
+        self.assertEqual(probe.record_failure(730.0), 300.0)
+
+        probe.record_success(1030.0)
+        self.assertEqual(probe.failure_count, 0)
+        self.assertFalse(probe.due(1034.9))
+        self.assertTrue(probe.due(1035.0))
+
+    def test_sensor_cache_backs_off_missing_lhm_and_wmi_without_5s_powershell_spam(self) -> None:
+        rest_calls = 0
+        wmi_calls = 0
+
+        def fake_rest() -> int | None:
+            nonlocal rest_calls
+            rest_calls += 1
+            return None
+
+        def fake_wmi() -> int | None:
+            nonlocal wmi_calls
+            wmi_calls += 1
+            return None
+
+        cache = desktop_bridge.SensorCache(
+            cpu_temp_interval=5.0,
+            gpu_interval=1.0,
+            initial_backoff=60.0,
+            max_backoff=300.0,
+        )
+        with (
+            mock.patch.object(desktop_bridge.psutil, "sensors_temperatures", None, create=True),
+            mock.patch.object(desktop_bridge, "read_lhm_cpu_temperature_rest", side_effect=fake_rest),
+            mock.patch.object(desktop_bridge, "read_lhm_cpu_temperature_wmi", side_effect=fake_wmi),
+            mock.patch.object(desktop_bridge, "read_nvidia_metrics", return_value={}),
+        ):
+            # Initial probe at t=10 fails -> backs off 60s
+            cache.poll_once(10.0)
+            self.assertEqual((rest_calls, wmi_calls), (1, 1))
+            self.assertIsNone(cache.cpu_temperature)
+
+            # Polling every 5s up to t=65 MUST NOT re-invoke LHM or PowerShell WMI
+            for t in (15.0, 20.0, 25.0, 40.0, 65.0):
+                cache.poll_once(t)
+            self.assertEqual((rest_calls, wmi_calls), (1, 1))
+
+            # At t=70 (after 60s backoff) one retry happens, then backs off 120s
+            cache.poll_once(70.0)
+            self.assertEqual((rest_calls, wmi_calls), (2, 2))
+            cache.poll_once(189.0)
+            self.assertEqual((rest_calls, wmi_calls), (2, 2))
+
+    def test_sensor_cache_background_thread_never_blocks_snapshot(self) -> None:
+        def slow_temp(**_kwargs: object) -> int:
+            time.sleep(0.25)
+            return 64
+
+        def slow_gpu() -> dict[str, int]:
+            time.sleep(0.25)
+            return {"gpu": 45, "gpu_mhz": 2100, "gpu_c": 58}
+
+        cache = desktop_bridge.SensorCache(poll_interval=0.05, cpu_temp_interval=5.0, gpu_interval=1.0)
+        with (
+            mock.patch.object(desktop_bridge, "read_cpu_temperature", side_effect=slow_temp),
+            mock.patch.object(desktop_bridge, "read_nvidia_metrics", side_effect=slow_gpu),
+        ):
+            cache.start()
+            try:
+                t0 = time.monotonic()
+                temp, gpu = cache.snapshot()
+                elapsed = time.monotonic() - t0
+                # Snapshot returns immediately without waiting for slow probes
+                self.assertLess(elapsed, 0.05)
+                self.assertIsInstance(gpu, dict)
+                self.assertTrue(temp is None or isinstance(temp, int))
+
+                # Wait for background daemon thread to populate cached metrics
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    temp, gpu = cache.snapshot()
+                    if temp == 64 and gpu.get("gpu") == 45:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(temp, 64)
+                self.assertEqual(gpu, {"gpu": 45, "gpu_mhz": 2100, "gpu_c": 58})
+            finally:
+                cache.stop()
+
+
 class HttpServerAndReconnectTests(unittest.TestCase):
+    def test_origin_whitelist_validation(self) -> None:
+        self.assertTrue(desktop_bridge.is_allowed_origin(None))
+        self.assertTrue(desktop_bridge.is_allowed_origin("http://localhost:8000"))
+        self.assertTrue(desktop_bridge.is_allowed_origin("http://127.0.0.1:5500"))
+        self.assertTrue(desktop_bridge.is_allowed_origin("https://localhost:8443"))
+        self.assertTrue(desktop_bridge.is_allowed_origin("https://1beyond1.github.io"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://evil.example"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io.evil.com"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io@evil.com"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("http://1beyond1.github.io"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("null"))
+
     def test_http_health_and_options_cors_headers(self) -> None:
         hub = desktop_bridge.StatusStreamHub()
         hub.set_serial_status(port="COM4", connected=True, mode="auto")
         server = desktop_bridge.start_status_server("127.0.0.1", 0, hub)
         try:
             port = server.server_address[1]
+            # 1. Local CLI request without Origin header is allowed without wildcard ACAO
             with urllib_request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as resp:
                 self.assertEqual(resp.status, 200)
-                self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
-                self.assertEqual(resp.headers.get("Access-Control-Allow-Private-Network"), "true")
+                self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+                self.assertEqual(resp.headers.get("Vary"), "Origin")
                 body = json.loads(resp.read().decode("utf-8"))
                 self.assertTrue(body["ok"])
                 self.assertEqual(body["protocol"], "PCSTAT")
@@ -211,13 +350,69 @@ class HttpServerAndReconnectTests(unittest.TestCase):
                 self.assertTrue(body["serial_connected"])
                 self.assertEqual(body["port_mode"], "auto")
 
-            req = urllib_request.Request(f"http://127.0.0.1:{port}/stream", method="OPTIONS")
-            with urllib_request.urlopen(req, timeout=2) as resp:
-                self.assertEqual(resp.status, 204)
-                self.assertEqual(resp.headers.get("Access-Control-Allow-Private-Network"), "true")
+            # 2. Allowed origins echo exact origin and Private-Network header
+            for origin in ("http://localhost:8000", "http://127.0.0.1:5500", "https://1beyond1.github.io"):
+                req = urllib_request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Origin": origin},
+                )
+                with urllib_request.urlopen(req, timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), origin)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Private-Network"), "true")
+                    self.assertEqual(resp.headers.get("Vary"), "Origin")
+
+                opt_req = urllib_request.Request(
+                    f"http://127.0.0.1:{port}/stream",
+                    method="OPTIONS",
+                    headers={"Origin": origin},
+                )
+                with urllib_request.urlopen(opt_req, timeout=2) as resp:
+                    self.assertEqual(resp.status, 204)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), origin)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Private-Network"), "true")
+
+            # 3. Arbitrary public origins are rejected with 403 and no ACAO header
+            for bad_origin in ("https://evil.example", "https://1beyond1.github.io.evil.com", "null"):
+                bad_req = urllib_request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Origin": bad_origin},
+                )
+                with self.assertRaises(urllib_error.HTTPError) as ctx:
+                    urllib_request.urlopen(bad_req, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                self.assertIsNone(ctx.exception.headers.get("Access-Control-Allow-Origin"))
+                ctx.exception.close()
+
+                bad_opt = urllib_request.Request(
+                    f"http://127.0.0.1:{port}/stream",
+                    method="OPTIONS",
+                    headers={"Origin": bad_origin},
+                )
+                with self.assertRaises(urllib_error.HTTPError) as ctx_opt:
+                    urllib_request.urlopen(bad_opt, timeout=2)
+                self.assertEqual(ctx_opt.exception.code, 403)
+                self.assertIsNone(ctx_opt.exception.headers.get("Access-Control-Allow-Origin"))
+                ctx_opt.exception.close()
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_http_only_once_handles_missing_network_counters(self) -> None:
+        buf = io.StringIO()
+        with (
+            mock.patch.object(desktop_bridge, "serial", None),
+            mock.patch.object(desktop_bridge.psutil, "net_io_counters", return_value=None),
+            mock.patch.object(desktop_bridge.time, "sleep", return_value=None),
+            mock.patch.object(desktop_bridge, "read_nvidia_metrics", return_value={}),
+            mock.patch.object(desktop_bridge, "read_cpu_temperature", return_value=None),
+            mock.patch.object(desktop_bridge, "read_display_refresh_hz", return_value=None),
+            redirect_stdout(buf),
+        ):
+            rc = desktop_bridge.main(["--http-only", "--http-port", "0", "--once", "--interval", "0.2"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("rx=0.0|tx=0.0", out)
 
     def test_http_only_once_works_without_serial_dependency(self) -> None:
         buf = io.StringIO()

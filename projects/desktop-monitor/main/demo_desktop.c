@@ -142,7 +142,7 @@ static uint8_t dm_metric_percent(dm_metric_t kind)
         return (uint8_t)((value * 100U) / 1000U);
     }
     case DM_METRIC_GAME_CPU: return s_state.cpu_percent;
-    case DM_METRIC_GAME_GPU: return s_state.gpu_percent;
+    case DM_METRIC_GAME_GPU: return s_state.gpu_valid ? s_state.gpu_percent : 0;
     default: return 0;
     }
 }
@@ -222,12 +222,16 @@ static void dm_metric_value(dm_metric_t kind, char *buffer, size_t capacity)
         }
         break;
     case DM_METRIC_GAME_GPU:
-        if (!s_state.gpu_valid) {
+        if (!s_state.gpu_valid && !s_state.gpu_frequency_valid && !s_state.gpu_temp_valid) {
             snprintf(buffer, capacity, "N/A");
-        } else if (s_state.gpu_frequency_valid) {
+        } else if (s_state.gpu_valid && s_state.gpu_frequency_valid) {
             snprintf(buffer, capacity, "%u%% %uM", s_state.gpu_percent, s_state.gpu_mhz);
-        } else {
+        } else if (s_state.gpu_valid) {
             snprintf(buffer, capacity, "%u%% --", s_state.gpu_percent);
+        } else if (s_state.gpu_frequency_valid) {
+            snprintf(buffer, capacity, "-- %uM", s_state.gpu_mhz);
+        } else {
+            snprintf(buffer, capacity, "--");
         }
         break;
     case DM_METRIC_REFRESH:
@@ -259,15 +263,17 @@ static const char *dm_metric_subtitle(dm_metric_t kind)
     case DM_METRIC_FREE: return "available";
     case DM_METRIC_HEALTH: return "last checked now";
     case DM_METRIC_GAME_CPU:
-        if (s_state.cpu_temp_c >= 0) {
+        if (s_state.cpu_temp_valid) {
             snprintf(dynamic, sizeof(dynamic), "%d C temperature", s_state.cpu_temp_c);
         } else {
             snprintf(dynamic, sizeof(dynamic), "CPU temp unavailable");
         }
         return dynamic;
     case DM_METRIC_GAME_GPU:
-        if (!s_state.gpu_valid) return "GPU unavailable";
-        if (s_state.gpu_temp_c >= 0) {
+        if (!s_state.gpu_valid && !s_state.gpu_frequency_valid && !s_state.gpu_temp_valid) {
+            return "GPU unavailable";
+        }
+        if (s_state.gpu_temp_valid) {
             snprintf(dynamic, sizeof(dynamic), "%d C temperature", s_state.gpu_temp_c);
         } else {
             snprintf(dynamic, sizeof(dynamic), "GPU temp unavailable");
@@ -463,23 +469,31 @@ static void dm_serial_worker(void *arg)
     (void)arg;
     char line[256];
     size_t length = 0;
+    bool discarding = false;
 
     while (s_serial_running) {
         int character = fgetc(stdin);
         if (character == EOF) {
+            clearerr(stdin);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         if (character == '\n' || character == '\r') {
-            if (length > 0) {
+            if (discarding) {
+                discarding = false;
+                length = 0;
+            } else if (length > 0) {
                 line[length] = '\0';
                 dm_apply_line(line);
                 length = 0;
             }
+        } else if (discarding) {
+            continue;
         } else if (length < sizeof(line) - 1) {
             line[length++] = (char)character;
         } else {
-            // Drop an overlong record instead of applying a truncated state.
+            // Drop an overlong record completely until the next line break.
+            discarding = true;
             length = 0;
         }
     }

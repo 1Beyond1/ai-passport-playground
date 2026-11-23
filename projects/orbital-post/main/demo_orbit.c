@@ -363,6 +363,7 @@ void demo_orbit_key(bsp_btn_t button, bsp_btn_ev_t event)
 
 bool demo_orbit_back(void)
 {
+    if (!screen) return true;
     last_activity = xTaskGetTickCount();
     if (!screen_awake) {
         screen_awake = true;

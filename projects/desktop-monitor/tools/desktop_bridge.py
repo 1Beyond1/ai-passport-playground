@@ -18,6 +18,7 @@ from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable, Optional
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 import psutil
@@ -114,25 +115,81 @@ class StatusStreamHub:
             return len(self._clients)
 
 
+ALLOWED_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+ALLOWED_HTTPS_HOSTS = frozenset({"1beyond1.github.io"})
+
+
+def is_allowed_origin(origin: Optional[str]) -> bool:
+    """Allow local CLI (no Origin), loopback dev servers, and GitHub Pages host."""
+
+    if origin is None or not origin.strip():
+        return True
+    cleaned = origin.strip()
+    try:
+        parsed = urllib_parse.urlsplit(cleaned)
+        port = parsed.port
+    except ValueError:
+        return False
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if hostname in ALLOWED_LOOPBACK_HOSTS:
+        return True
+    if hostname in ALLOWED_HTTPS_HOSTS and scheme == "https" and port in (None, 443):
+        return True
+    return False
+
+
 class BridgeRequestHandler(BaseHTTPRequestHandler):
     """Serve a localhost-only SSE stream for the browser simulator."""
 
     hub: StatusStreamHub
     server_version = "AIPASSPORT-Bridge/1.0"
 
-    def _write_cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
+    def _check_origin(self) -> tuple[bool, Optional[str]]:
+        raw_origin = self.headers.get("Origin")
+        if raw_origin is None:
+            return (True, None)
+        cleaned = raw_origin.strip()
+        if not cleaned or not is_allowed_origin(cleaned):
+            payload = json.dumps({"ok": False, "error": "origin not allowed"}).encode("ascii")
+            self.send_response(403)
+            self.send_header("Vary", "Origin")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.end_headers()
+            self.wfile.write(payload)
+            return (False, None)
+        return (True, cleaned)
+
+    def _write_cors(self, allowed_origin: Optional[str]) -> None:
+        self.send_header("Vary", "Origin")
+        if allowed_origin is not None:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Cache-Control", "no-cache, no-transform")
 
     def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib handler API
+        ok, allowed_origin = self._check_origin()
+        if not ok:
+            return
         self.send_response(204)
-        self._write_cors()
+        self._write_cors(allowed_origin)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        ok, allowed_origin = self._check_origin()
+        if not ok:
+            return
+
         if self.path == "/health":
             health_body = {
                 "ok": True,
@@ -142,7 +199,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             }
             payload = json.dumps(health_body).encode("ascii")
             self.send_response(200)
-            self._write_cors()
+            self._write_cors(allowed_origin)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -155,7 +212,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
         client = self.hub.subscribe()
         self.send_response(200)
-        self._write_cors()
+        self._write_cors(allowed_origin)
         self.send_header("Connection", "keep-alive")
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.end_headers()
@@ -418,35 +475,52 @@ class CpuFrequencySampler:
         self._ready = False
 
 
-def read_cpu_temperature() -> Optional[int]:
-    """Read a CPU temperature from psutil or LibreHardwareMonitor if available."""
+class BackoffProbe:
+    """Exponential backoff scheduler for optional sensor probes that may be absent."""
 
-    sensors = getattr(psutil, "sensors_temperatures", None)
-    if sensors is not None:
-        try:
-            groups = sensors()
-        except (AttributeError, OSError):
-            groups = {}
-        candidates = []
-        for entries in groups.values():
-            for entry in entries:
-                name = str(getattr(entry, "label", "") or getattr(entry, "name", ""))
-                if any(token in name.lower() for token in ("cpu", "package", "tctl", "tdie")):
-                    current = getattr(entry, "current", None)
-                    if current is not None:
-                        candidates.append(float(current))
-        if candidates:
-            return round(max(candidates))
+    def __init__(
+        self,
+        *,
+        success_interval: float,
+        initial_backoff: float = 60.0,
+        max_backoff: float = 300.0,
+        backoff_factor: float = 2.0,
+    ) -> None:
+        self.success_interval = max(0.1, success_interval)
+        self.initial_backoff = max(self.success_interval, initial_backoff)
+        self.max_backoff = max(self.initial_backoff, max_backoff)
+        self.backoff_factor = max(1.0, backoff_factor)
+        self._next_allowed = 0.0
+        self._failure_count = 0
 
-    # Windows does not expose CPU package temperature through psutil. Prefer
-    # LibreHardwareMonitor's loopback REST endpoint when it is enabled; this
-    # avoids relying on the WMI exporter, which is unavailable in some LHM
-    # builds. The query is cached by SensorCache below.
-    temperature = read_lhm_cpu_temperature_rest()
-    if temperature is not None:
-        return temperature
+    def due(self, now: float) -> bool:
+        return now >= self._next_allowed
 
-    # Keep the read-only WMI namespace as a fallback for older LHM builds.
+    def record_success(self, now: float) -> None:
+        self._failure_count = 0
+        self._next_allowed = now + self.success_interval
+
+    def record_failure(self, now: float) -> float:
+        self._failure_count += 1
+        delay = min(
+            self.max_backoff,
+            self.initial_backoff * (self.backoff_factor ** (self._failure_count - 1)),
+        )
+        self._next_allowed = now + delay
+        return delay
+
+    @property
+    def failure_count(self) -> int:
+        return self._failure_count
+
+    @property
+    def next_allowed(self) -> float:
+        return self._next_allowed
+
+
+def read_lhm_cpu_temperature_wmi() -> Optional[int]:
+    """Fallback CPU temperature query via LibreHardwareMonitor's WMI namespace."""
+
     if os.name != "nt":
         return None
     powershell = shutil.which("powershell") or shutil.which("pwsh")
@@ -478,18 +552,180 @@ def read_cpu_temperature() -> Optional[int]:
     return temperature if temperature is not None and -40 <= temperature <= 150 else None
 
 
-class SensorCache:
-    """Keep slower optional sensor discovery off the one-second sample path."""
+def read_cpu_temperature(
+    *,
+    rest_probe: Optional[BackoffProbe] = None,
+    wmi_probe: Optional[BackoffProbe] = None,
+    now: Optional[float] = None,
+) -> Optional[int]:
+    """Read a CPU temperature from psutil or LibreHardwareMonitor if available."""
 
-    def __init__(self) -> None:
-        self.cpu_temperature: Optional[int] = None
-        self.last_refresh = 0.0
+    sensors = getattr(psutil, "sensors_temperatures", None)
+    if sensors is not None:
+        try:
+            groups = sensors()
+        except (AttributeError, OSError):
+            groups = {}
+        candidates = []
+        for entries in groups.values():
+            for entry in entries:
+                name = str(getattr(entry, "label", "") or getattr(entry, "name", ""))
+                if any(token in name.lower() for token in ("cpu", "package", "tctl", "tdie")):
+                    current = getattr(entry, "current", None)
+                    if current is not None:
+                        candidates.append(float(current))
+        if candidates:
+            return round(max(candidates))
+
+    sample_time = time.monotonic() if now is None else now
+
+    # Windows does not expose CPU package temperature through psutil. Prefer
+    # LibreHardwareMonitor's loopback REST endpoint when it is enabled, with
+    # exponential backoff when the endpoint is absent.
+    if rest_probe is None or rest_probe.due(sample_time):
+        temperature = read_lhm_cpu_temperature_rest()
+        if temperature is not None:
+            if rest_probe is not None:
+                rest_probe.record_success(sample_time)
+            return temperature
+        if rest_probe is not None:
+            rest_probe.record_failure(sample_time)
+
+    # Keep the read-only WMI namespace as a backed-off fallback for older LHM builds.
+    if wmi_probe is None or wmi_probe.due(sample_time):
+        temperature = read_lhm_cpu_temperature_wmi()
+        if temperature is not None:
+            if wmi_probe is not None:
+                wmi_probe.record_success(sample_time)
+            return temperature
+        if wmi_probe is not None:
+            wmi_probe.record_failure(sample_time)
+
+    return None
+
+
+class SensorCache:
+    """Refresh slow optional sensors asynchronously in a daemon thread with backoff."""
+
+    def __init__(
+        self,
+        *,
+        poll_interval: float = 0.5,
+        cpu_temp_interval: float = 5.0,
+        gpu_interval: float = 1.0,
+        initial_backoff: float = 60.0,
+        max_backoff: float = 300.0,
+        backoff_factor: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._poll_interval = max(0.05, poll_interval)
+        self._clock = clock
+        self._cpu_temperature: Optional[int] = None
+        self._gpu_metrics: dict[str, int] = {}
+        self._cpu_temp_probe = BackoffProbe(
+            success_interval=cpu_temp_interval,
+            initial_backoff=initial_backoff,
+            max_backoff=max_backoff,
+            backoff_factor=backoff_factor,
+        )
+        self._lhm_rest_probe = BackoffProbe(
+            success_interval=cpu_temp_interval,
+            initial_backoff=initial_backoff,
+            max_backoff=max_backoff,
+            backoff_factor=backoff_factor,
+        )
+        self._lhm_wmi_probe = BackoffProbe(
+            success_interval=cpu_temp_interval,
+            initial_backoff=initial_backoff,
+            max_backoff=max_backoff,
+            backoff_factor=backoff_factor,
+        )
+        self._gpu_probe = BackoffProbe(
+            success_interval=gpu_interval,
+            initial_backoff=initial_backoff,
+            max_backoff=max_backoff,
+            backoff_factor=backoff_factor,
+        )
+
+    @property
+    def cpu_temperature(self) -> Optional[int]:
+        with self._lock:
+            return self._cpu_temperature
+
+    @property
+    def gpu_metrics(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._gpu_metrics)
+
+    def snapshot(self) -> tuple[Optional[int], dict[str, int]]:
+        """Return cached optional sensor readings without blocking the serial loop."""
+
+        with self._lock:
+            return (self._cpu_temperature, dict(self._gpu_metrics))
+
+    def poll_once(self, now: Optional[float] = None) -> None:
+        explicit_now = now is not None
+        sample_time = self._clock() if not explicit_now else now
+
+        if self._gpu_probe.due(sample_time):
+            metrics = read_nvidia_metrics()
+            done_time = sample_time if explicit_now else self._clock()
+            if metrics:
+                self._gpu_probe.record_success(done_time)
+                cached_gpu = dict(metrics)
+            else:
+                self._gpu_probe.record_failure(done_time)
+                cached_gpu = {}
+            with self._lock:
+                self._gpu_metrics = cached_gpu
+
+        temp_time = sample_time if explicit_now else self._clock()
+        if self._cpu_temp_probe.due(temp_time):
+            temperature = read_cpu_temperature(
+                rest_probe=self._lhm_rest_probe,
+                wmi_probe=self._lhm_wmi_probe,
+                now=temp_time,
+            )
+            done_time = temp_time if explicit_now else self._clock()
+            if temperature is not None:
+                self._cpu_temp_probe.record_success(done_time)
+            else:
+                self._cpu_temp_probe.record_failure(done_time)
+            with self._lock:
+                self._cpu_temperature = temperature
 
     def refresh(self, now: float) -> None:
-        if now - self.last_refresh < 5.0:
+        self.poll_once(now)
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.poll_once()
+            except Exception:
+                # Never let an unexpected sensor probe error kill the background worker.
+                pass
+            self._stop_event.wait(self._poll_interval)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
             return
-        self.cpu_temperature = read_cpu_temperature()
-        self.last_refresh = now
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="desktop-bridge-sensors",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 0.5) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._thread = None
 
 
 if os.name == "nt":
@@ -572,12 +808,27 @@ def format_uptime(seconds: float) -> str:
     return f"{minutes}m"
 
 
+def sanitize_host_name(host_name: Optional[str]) -> str:
+    """Return a single-line, ASCII-safe host label that fits the device buffer."""
+
+    raw = (host_name if host_name is not None else platform.node()) or "Windows"
+    cleaned = raw.replace("\r", "").replace("\n", "").replace("|", "_").replace("=", "_").strip()
+    return cleaned.encode("ascii", "replace").decode("ascii")[:20] or "Windows"
+
+
 def safe_host_name() -> str:
     """Return an ASCII-safe host label that fits the device buffer."""
 
-    host = platform.node() or "Windows"
-    host = host.replace("|", "_").replace("=", "_")
-    return host.encode("ascii", "replace").decode("ascii")[:20] or "Windows"
+    return sanitize_host_name(None)
+
+
+def read_net_io_counters() -> Optional[Any]:
+    """Read aggregate network byte counters, returning None if unavailable."""
+
+    try:
+        return psutil.net_io_counters()
+    except OSError:
+        return None
 
 
 def default_system_disk_path() -> str:
@@ -735,8 +986,12 @@ def build_status_line(
     """
 
     elapsed = max(elapsed, 0.001)
-    rx_rate = max(0, network_after.bytes_recv - network_before.bytes_recv)
-    tx_rate = max(0, network_after.bytes_sent - network_before.bytes_sent)
+    if network_before is not None and network_after is not None:
+        rx_rate = max(0, network_after.bytes_recv - network_before.bytes_recv)
+        tx_rate = max(0, network_after.bytes_sent - network_before.bytes_sent)
+    else:
+        rx_rate = 0
+        tx_rate = 0
     rx_mb = min(MAX_RATE_MB_S, rx_rate / elapsed / (1024 * 1024))
     tx_mb = min(MAX_RATE_MB_S, tx_rate / elapsed / (1024 * 1024))
     core_fields = [
@@ -773,17 +1028,13 @@ def build_status_line(
         else []
     )
 
-    resolved_time = time_text if time_text is not None else time.strftime("%H:%M")
+    resolved_time = (time_text if time_text is not None else time.strftime("%H:%M")).replace("\r", "").replace("\n", "")
     resolved_uptime = (
         uptime_text
         if uptime_text is not None
         else format_uptime(time.time() - psutil.boot_time())
-    )
-    resolved_host = (
-        host_name.replace("|", "_").replace("=", "_").encode("ascii", "replace").decode("ascii")[:20] or "Windows"
-        if host_name is not None
-        else safe_host_name()
-    )
+    ).replace("\r", "").replace("\n", "")
+    resolved_host = sanitize_host_name(host_name)
 
     def encode_record(extras: list[str], host: str) -> bytes:
         all_fields = [
@@ -867,9 +1118,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     auto_mode = not args.http_only and is_auto_port(args.port)
     port_mode = "http-only" if args.http_only else ("auto" if auto_mode else "manual")
     psutil.cpu_percent(interval=None)
-    previous_network = psutil.net_io_counters()
+    previous_network = read_net_io_counters()
     previous_time = time.monotonic()
     sensor_cache = SensorCache()
+    sensor_cache.start()
     cpu_frequency = CpuFrequencySampler()
     connection: Optional[Any] = None
     active_port: Optional[str] = None
@@ -928,10 +1180,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             time.sleep(interval)
             now = time.monotonic()
-            current_network = psutil.net_io_counters()
+            current_network = read_net_io_counters()
             virtual_memory = psutil.virtual_memory()
             disk_usage = psutil.disk_usage(default_system_disk_path())
-            sensor_cache.refresh(now)
+            cpu_temp_c, gpu_metrics = sensor_cache.snapshot()
             payload = build_status_line(
                 network_before=previous_network,
                 network_after=current_network,
@@ -940,8 +1192,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 memory=virtual_memory.percent,
                 disk=disk_usage.percent,
                 cpu_mhz=cpu_frequency.sample(),
-                gpu=read_nvidia_metrics(),
-                cpu_temp_c=sensor_cache.cpu_temperature,
+                gpu=gpu_metrics,
+                cpu_temp_c=cpu_temp_c,
                 refresh_hz=read_display_refresh_hz(),
                 mem_used_gb=bytes_to_gb(virtual_memory.used),
                 mem_total_gb=bytes_to_gb(virtual_memory.total),
@@ -980,6 +1232,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("Stopping desktop bridge", flush=True)
         return 0
     finally:
+        sensor_cache.stop()
         close_serial_safely(connection)
         cpu_frequency.close()
         if stream_server is not None:
