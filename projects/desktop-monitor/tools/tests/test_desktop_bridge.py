@@ -240,6 +240,43 @@ class AsyncSensorCacheAndBackoffTests(unittest.TestCase):
         self.assertFalse(probe.due(1034.9))
         self.assertTrue(probe.due(1035.0))
 
+    def test_backoff_probe_handles_2000_consecutive_failures_without_overflow(self) -> None:
+        probe = desktop_bridge.BackoffProbe(
+            success_interval=5.0,
+            initial_backoff=60.0,
+            max_backoff=300.0,
+            backoff_factor=2.0,
+        )
+        now = 0.0
+        for idx in range(1, 2001):
+            delay = probe.record_failure(now)
+            self.assertGreaterEqual(delay, 60.0)
+            self.assertLessEqual(delay, 300.0)
+            if idx >= 4:
+                self.assertEqual(delay, 300.0)
+            self.assertFalse(probe.due(now + delay - 0.1))
+            self.assertTrue(probe.due(now + delay))
+            now += delay
+        self.assertEqual(probe.failure_count, 2000)
+
+        # Recovery resets backoff cleanly back to initial 60s on next failure
+        probe.record_success(now)
+        self.assertEqual(probe.failure_count, 0)
+        self.assertEqual(probe.record_failure(now + 5.0), 60.0)
+
+    def test_poll_once_isolates_gpu_probe_exceptions_from_cpu_temp_probe(self) -> None:
+        cache = desktop_bridge.SensorCache(cpu_temp_interval=5.0, gpu_interval=1.0)
+        with (
+            mock.patch.object(desktop_bridge, "read_nvidia_metrics", side_effect=RuntimeError("gpu boom")),
+            mock.patch.object(desktop_bridge, "read_cpu_temperature", return_value=67),
+        ):
+            cache.poll_once(10.0)
+        temp, gpu = cache.snapshot()
+        self.assertEqual(temp, 67)
+        self.assertEqual(gpu, {})
+        # GPU probe must still have backed off despite raising an exception
+        self.assertFalse(cache._gpu_probe.due(15.0))
+
     def test_sensor_cache_backs_off_missing_lhm_and_wmi_without_5s_powershell_spam(self) -> None:
         rest_calls = 0
         wmi_calls = 0
@@ -331,6 +368,12 @@ class HttpServerAndReconnectTests(unittest.TestCase):
         self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io@evil.com"))
         self.assertFalse(desktop_bridge.is_allowed_origin("http://1beyond1.github.io"))
         self.assertFalse(desktop_bridge.is_allowed_origin("null"))
+        self.assertFalse(desktop_bridge.is_allowed_origin(""))
+        self.assertFalse(desktop_bridge.is_allowed_origin("http://localhost\t:8000"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("http://localhost:8000\n"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io/"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io?"))
+        self.assertFalse(desktop_bridge.is_allowed_origin("https://1beyond1.github.io#"))
 
     def test_http_health_and_options_cors_headers(self) -> None:
         hub = desktop_bridge.StatusStreamHub()

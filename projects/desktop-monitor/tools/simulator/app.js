@@ -321,7 +321,7 @@
           continue;
         }
 
-        const lines = combined.split(/\r?\n/);
+        const lines = combined.split(/\r\n|\n|\r/);
         const tail = lines.pop() ?? "";
         for (const line of lines) {
           if (droppingOverlong) {
@@ -365,6 +365,9 @@
       return;
     }
     await closeSerialPort();
+    if (state.source !== "serial") {
+      return;
+    }
     const sessionId = state.serialSessionId;
     let port = null;
     try {

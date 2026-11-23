@@ -424,18 +424,18 @@ test("P1-3 & P2 (vm): app.js closes serial on mode switch & EOF, bounds serialBu
     assert.equal(elements.get("netOutput").textContent, "125.4 MB/s");
 
     // 3. Serial EOF cleans up port, resets serialConnected=false, and re-enables connect button,
-    //    while dropping an overlong unterminated chunk (> 4096 chars) without unbounded buffer growth
+    //    while dropping an overlong unterminated chunk (> 4096 chars) and parsing pure \r frames
     sim.setSerialMode();
     nextPortBehavior = () => [
       "X".repeat(5000),
-      "TAIL_DROPPED\nPCSTAT|cpu=77|mem=33|disk=22|rx=25.0|tx=1.0|host=SerialBox\n"
+      "TAIL_DROPPED\nPCSTAT|cpu=77|mem=33|disk=22|rx=25.0|tx=1.0|host=SerialBox\rPCSTAT|cpu=81|mem=35|disk=24|rx=30.0|tx=2.0|host=CRBox\r"
     ];
     await sim.connectSerial();
     await new Promise((r) => setTimeout(r, 30));
 
-    assert.equal(sim.state.values.cpu, 77);
-    assert.equal(sim.state.values.host, "SerialBox");
-    assert.equal(sim.state.values.net, 250);
+    assert.equal(sim.state.values.cpu, 81);
+    assert.equal(sim.state.values.host, "CRBox");
+    assert.equal(sim.state.values.net, 300);
     assert.equal(sim.state.serialBuffer.length, 0);
     assert.equal(sim.state.serialConnected, false);
     assert.equal(elements.get("serialConnect").disabled, false);
@@ -455,6 +455,11 @@ test("P1-3 & P2 (vm): app.js closes serial on mode switch & EOF, bounds serialBu
     assert.equal(ports[1].cancelled, true);
     assert.equal(ports[1].lockReleased, true);
     assert.equal(ports[1].closed, true);
+
+    // 4b. connectSerial() checks state.source === "serial" after closeSerialPort() and does not prompt picker if switched away
+    const portsBefore = ports.length;
+    await sim.connectSerial();
+    assert.equal(ports.length, portsBefore);
 
     // 5. Bridge stream.onerror clears state.live and re-renders offline WAIT screen
     const stream = eventSources[eventSources.length - 1];

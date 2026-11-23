@@ -122,11 +122,14 @@ ALLOWED_HTTPS_HOSTS = frozenset({"1beyond1.github.io"})
 def is_allowed_origin(origin: Optional[str]) -> bool:
     """Allow local CLI (no Origin), loopback dev servers, and GitHub Pages host."""
 
-    if origin is None or not origin.strip():
+    if origin is None:
         return True
-    cleaned = origin.strip()
+    if not origin or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in origin):
+        return False
+    if "?" in origin or "#" in origin:
+        return False
     try:
-        parsed = urllib_parse.urlsplit(cleaned)
+        parsed = urllib_parse.urlsplit(origin)
         port = parsed.port
     except ValueError:
         return False
@@ -135,7 +138,7 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
         return False
     if parsed.username is not None or parsed.password is not None:
         return False
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+    if parsed.path != "" or parsed.query or parsed.fragment:
         return False
     hostname = (parsed.hostname or "").lower()
     if hostname in ALLOWED_LOOPBACK_HOSTS:
@@ -155,8 +158,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         raw_origin = self.headers.get("Origin")
         if raw_origin is None:
             return (True, None)
-        cleaned = raw_origin.strip()
-        if not cleaned or not is_allowed_origin(cleaned):
+        if not is_allowed_origin(raw_origin):
             payload = json.dumps({"ok": False, "error": "origin not allowed"}).encode("ascii")
             self.send_response(403)
             self.send_header("Vary", "Origin")
@@ -166,7 +168,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return (False, None)
-        return (True, cleaned)
+        return (True, raw_origin)
 
     def _write_cors(self, allowed_origin: Optional[str]) -> None:
         self.send_header("Vary", "Origin")
@@ -492,22 +494,25 @@ class BackoffProbe:
         self.backoff_factor = max(1.0, backoff_factor)
         self._next_allowed = 0.0
         self._failure_count = 0
+        self._current_backoff = self.initial_backoff
 
     def due(self, now: float) -> bool:
         return now >= self._next_allowed
 
     def record_success(self, now: float) -> None:
         self._failure_count = 0
+        self._current_backoff = self.initial_backoff
         self._next_allowed = now + self.success_interval
 
     def record_failure(self, now: float) -> float:
         self._failure_count += 1
-        delay = min(
-            self.max_backoff,
-            self.initial_backoff * (self.backoff_factor ** (self._failure_count - 1)),
-        )
-        self._next_allowed = now + delay
-        return delay
+        if self._failure_count == 1:
+            delay = self.initial_backoff
+        else:
+            delay = min(self.max_backoff, self._current_backoff * self.backoff_factor)
+        self._current_backoff = min(self.max_backoff, delay)
+        self._next_allowed = now + self._current_backoff
+        return self._current_backoff
 
     @property
     def failure_count(self) -> int:
@@ -619,7 +624,9 @@ class SensorCache:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._lock = threading.Lock()
-        self._stop_event = threading.Event()
+        self._poll_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop_event: Optional[threading.Event] = None
         self._thread: Optional[threading.Thread] = None
         self._poll_interval = max(0.05, poll_interval)
         self._clock = clock
@@ -667,65 +674,81 @@ class SensorCache:
             return (self._cpu_temperature, dict(self._gpu_metrics))
 
     def poll_once(self, now: Optional[float] = None) -> None:
-        explicit_now = now is not None
-        sample_time = self._clock() if not explicit_now else now
+        with self._poll_lock:
+            explicit_now = now is not None
+            sample_time = self._clock() if not explicit_now else now
 
-        if self._gpu_probe.due(sample_time):
-            metrics = read_nvidia_metrics()
-            done_time = sample_time if explicit_now else self._clock()
-            if metrics:
-                self._gpu_probe.record_success(done_time)
-                cached_gpu = dict(metrics)
-            else:
-                self._gpu_probe.record_failure(done_time)
-                cached_gpu = {}
-            with self._lock:
-                self._gpu_metrics = cached_gpu
+            if self._gpu_probe.due(sample_time):
+                try:
+                    metrics = read_nvidia_metrics()
+                except Exception:
+                    metrics = {}
+                done_time = sample_time if explicit_now else self._clock()
+                if metrics:
+                    self._gpu_probe.record_success(done_time)
+                    cached_gpu = dict(metrics)
+                else:
+                    self._gpu_probe.record_failure(done_time)
+                    cached_gpu = {}
+                with self._lock:
+                    self._gpu_metrics = cached_gpu
 
-        temp_time = sample_time if explicit_now else self._clock()
-        if self._cpu_temp_probe.due(temp_time):
-            temperature = read_cpu_temperature(
-                rest_probe=self._lhm_rest_probe,
-                wmi_probe=self._lhm_wmi_probe,
-                now=temp_time,
-            )
-            done_time = temp_time if explicit_now else self._clock()
-            if temperature is not None:
-                self._cpu_temp_probe.record_success(done_time)
-            else:
-                self._cpu_temp_probe.record_failure(done_time)
-            with self._lock:
-                self._cpu_temperature = temperature
+            temp_time = sample_time if explicit_now else self._clock()
+            if self._cpu_temp_probe.due(temp_time):
+                try:
+                    temperature = read_cpu_temperature(
+                        rest_probe=self._lhm_rest_probe,
+                        wmi_probe=self._lhm_wmi_probe,
+                        now=temp_time,
+                    )
+                except Exception:
+                    temperature = None
+                done_time = temp_time if explicit_now else self._clock()
+                if temperature is not None:
+                    self._cpu_temp_probe.record_success(done_time)
+                else:
+                    self._cpu_temp_probe.record_failure(done_time)
+                with self._lock:
+                    self._cpu_temperature = temperature
 
     def refresh(self, now: float) -> None:
         self.poll_once(now)
 
-    def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _run_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 self.poll_once()
             except Exception:
                 # Never let an unexpected sensor probe error kill the background worker.
                 pass
-            self._stop_event.wait(self._poll_interval)
+            stop_event.wait(self._poll_interval)
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="desktop-bridge-sensors",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                args=(stop_event,),
+                name="desktop-bridge-sensors",
+                daemon=True,
+            )
+            self._thread.start()
 
     def stop(self, timeout: float = 0.5) -> None:
-        self._stop_event.set()
-        thread = self._thread
+        with self._lifecycle_lock:
+            stop_event = self._stop_event
+            thread = self._thread
+            if stop_event is not None:
+                stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
-        self._thread = None
+        with self._lifecycle_lock:
+            if self._thread is thread and (thread is None or not thread.is_alive()):
+                self._thread = None
+                self._stop_event = None
 
 
 if os.name == "nt":
